@@ -1,0 +1,956 @@
+"""
+app.py — Gap & Go Pre-Market Stock Screener
+============================================
+Free, read-only Streamlit dashboard for US equity momentum scanning.
+Data sources: Yahoo Finance (yfinance + day-gainers page scrape)
+Hosting: Streamlit Community Cloud (free tier)
+"""
+
+import time
+import warnings
+from datetime import datetime, date
+from typing import Optional
+import re
+
+import pandas as pd
+import requests
+import streamlit as st
+import yfinance as yf
+from bs4 import BeautifulSoup
+
+warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG  (must be first Streamlit call)
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Gap & Go Scanner",
+    page_icon="📡",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSTOM CSS — Dark terminal aesthetic
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+/* ── Google Fonts ── */
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap');
+
+/* ── Root palette ── */
+:root {
+    --bg-primary:    #090d13;
+    --bg-card:       #0d1520;
+    --bg-surface:    #111c2b;
+    --border-dim:    #1a2d45;
+    --border-bright: #1f3a56;
+    --accent-green:  #00e5a0;
+    --accent-amber:  #ffb800;
+    --accent-red:    #ff4560;
+    --accent-blue:   #3b9eff;
+    --text-primary:  #e8f0fe;
+    --text-secondary:#7a9ab8;
+    --text-dim:      #3d5a73;
+    --mono: 'Space Mono', monospace;
+    --sans: 'Syne', sans-serif;
+}
+
+/* ── Global overrides ── */
+html, body, [class*="css"] {
+    background-color: var(--bg-primary) !important;
+    color: var(--text-primary) !important;
+    font-family: var(--sans) !important;
+}
+
+/* ── Hide Streamlit chrome ── */
+#MainMenu, footer, header { visibility: hidden; }
+.block-container { padding-top: 1.5rem !important; padding-bottom: 2rem !important; max-width: 1400px !important; }
+
+/* ── Masthead ── */
+.masthead {
+    display: flex;
+    align-items: baseline;
+    gap: 1rem;
+    border-bottom: 1px solid var(--border-bright);
+    padding-bottom: 0.75rem;
+    margin-bottom: 0.25rem;
+}
+.masthead-title {
+    font-family: var(--sans);
+    font-weight: 800;
+    font-size: 2rem;
+    letter-spacing: -0.04em;
+    color: var(--text-primary);
+    line-height: 1;
+}
+.masthead-sub {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+}
+.ticker-badge {
+    font-family: var(--mono);
+    font-size: 0.65rem;
+    padding: 2px 8px;
+    border-radius: 2px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-bright);
+    color: var(--accent-green);
+    letter-spacing: 0.1em;
+}
+
+/* ── KPI metric cards ── */
+.kpi-row { display: flex; gap: 12px; margin: 1rem 0; }
+.kpi-card {
+    flex: 1;
+    background: var(--bg-card);
+    border: 1px solid var(--border-dim);
+    border-top: 2px solid var(--accent-green);
+    padding: 14px 18px;
+    border-radius: 3px;
+}
+.kpi-label {
+    font-family: var(--mono);
+    font-size: 0.6rem;
+    color: var(--text-dim);
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+}
+.kpi-value {
+    font-family: var(--mono);
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    line-height: 1;
+}
+.kpi-value.green { color: var(--accent-green); }
+.kpi-value.amber { color: var(--accent-amber); }
+.kpi-value.red   { color: var(--accent-red);   }
+
+/* ── Scan button ── */
+div.stButton > button {
+    background: transparent !important;
+    border: 1px solid var(--accent-green) !important;
+    color: var(--accent-green) !important;
+    font-family: var(--mono) !important;
+    font-size: 0.75rem !important;
+    letter-spacing: 0.15em !important;
+    text-transform: uppercase !important;
+    padding: 10px 28px !important;
+    border-radius: 2px !important;
+    transition: all 0.15s ease !important;
+}
+div.stButton > button:hover {
+    background: var(--accent-green) !important;
+    color: var(--bg-primary) !important;
+    box-shadow: 0 0 20px rgba(0,229,160,0.25) !important;
+}
+
+/* ── Filter sidebar / expander ── */
+.stExpander {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border-dim) !important;
+    border-radius: 3px !important;
+}
+
+/* ── Dataframe / table ── */
+.stDataFrame, iframe { background: var(--bg-card) !important; border-radius: 3px !important; }
+
+/* ── Streamlit metrics ── */
+[data-testid="metric-container"] {
+    background: var(--bg-card);
+    border: 1px solid var(--border-dim);
+    border-top: 2px solid var(--accent-green);
+    padding: 12px 16px;
+    border-radius: 3px;
+}
+[data-testid="metric-container"] label { font-family: var(--mono) !important; font-size: 0.6rem !important; color: var(--text-dim) !important; letter-spacing: 0.15em !important; }
+[data-testid="metric-container"] [data-testid="stMetricValue"] { font-family: var(--mono) !important; font-size: 1.4rem !important; }
+
+/* ── Status badges ── */
+.badge-premium {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 0.6rem;
+    padding: 2px 7px;
+    background: rgba(255,184,0,0.12);
+    border: 1px solid var(--accent-amber);
+    color: var(--accent-amber);
+    border-radius: 2px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+}
+.badge-standard {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 0.6rem;
+    padding: 2px 7px;
+    background: rgba(0,229,160,0.08);
+    border: 1px solid rgba(0,229,160,0.3);
+    color: var(--accent-green);
+    border-radius: 2px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+}
+
+/* ── Selectbox / slider ── */
+.stSelectbox > div > div, .stSlider { font-family: var(--mono) !important; }
+.stProgress > div > div { background-color: var(--accent-green) !important; }
+
+/* ── Info / warning boxes ── */
+.stAlert { border-radius: 3px !important; font-family: var(--mono) !important; font-size: 0.75rem !important; }
+
+/* ── Divider ── */
+hr { border-color: var(--border-dim) !important; margin: 1.2rem 0 !important; }
+
+/* ── Scanline overlay (subtle) ── */
+body::before {
+    content: '';
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0,0,0,0.03) 2px,
+        rgba(0,0,0,0.03) 4px
+    );
+    pointer-events: none;
+    z-index: 9999;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS & DEFAULTS
+# ─────────────────────────────────────────────────────────────────────────────
+YF_GAINERS_URL  = "https://finance.yahoo.com/markets/stocks/gainers/"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+REQUEST_DELAY   = 0.35   # seconds between yfinance calls — polite pacing
+MAX_TICKERS     = 150    # max tickers to detail-fetch from the gainers list
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA LAYER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_float(val) -> Optional[float]:
+    """Convert any value to float or return None."""
+    try:
+        return float(val) if val is not None else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _fmt_volume(v) -> str:
+    if v is None: return "N/A"
+    v = int(v)
+    if v >= 1_000_000: return f"{v/1_000_000:.2f}M"
+    if v >= 1_000:     return f"{v/1_000:.1f}K"
+    return str(v)
+
+
+def _fmt_float_shares(v) -> str:
+    if v is None: return "N/A"
+    v = int(v)
+    if v >= 1_000_000: return f"{v/1_000_000:.2f}M"
+    return f"{v:,}"
+
+
+def _fmt_currency(v) -> str:
+    if v is None: return "N/A"
+    return f"${float(v):.2f}"
+
+
+def _fmt_market_cap(v) -> str:
+    if v is None: return "N/A"
+    v = float(v)
+    if v >= 1e9:  return f"${v/1e9:.2f}B"
+    if v >= 1e6:  return f"${v/1e6:.0f}M"
+    return f"${v:,.0f}"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_gainer_tickers() -> list[str]:
+    """
+    Scrapes Yahoo Finance 'Markets > Stocks > Gainers' page for the
+    current top-gaining US equities.
+
+    Improvements over a naïve approach:
+    • Uses a realistic User-Agent to avoid 429s
+    • Falls back to a hardcoded yfinance screener query if scraping fails
+    • Deduplicates and strips any non-equity suffixes (e.g. warrants)
+    • Filters out obvious non-US patterns (tickers containing '.' or '-' 
+      which typically denote foreign or preferred shares)
+    """
+    tickers: list[str] = []
+
+    # ── Attempt 1: Scrape Yahoo Finance gainers page ────────────────────
+    try:
+        resp = requests.get(YF_GAINERS_URL, headers=HEADERS, timeout=15)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # Yahoo Finance renders tickers in <a> tags or data-symbol attrs
+            # Try data-symbol first (most reliable across page revisions)
+            found = set()
+            for tag in soup.find_all(attrs={"data-symbol": True}):
+                sym = tag["data-symbol"].strip().upper()
+                if _is_valid_us_ticker(sym):
+                    found.add(sym)
+
+            # Fallback: scan all <a> hrefs for /quote/TICKER pattern
+            if not found:
+                for a in soup.find_all("a", href=True):
+                    m = re.search(r"/quote/([A-Z]{1,5})(?:\?|/|$)", a["href"])
+                    if m:
+                        sym = m.group(1)
+                        if _is_valid_us_ticker(sym):
+                            found.add(sym)
+
+            tickers = list(found)[:MAX_TICKERS]
+
+    except Exception as e:
+        st.warning(f"Yahoo scrape attempt failed ({e}). Trying backup method…")
+
+    # ── Attempt 2: yfinance built-in screener (backup) ──────────────────
+    if not tickers:
+        try:
+            screen = yf.screen(
+                "day_gainers",
+                sortField="percentChange",
+                sortAsc=False,
+                offset=0,
+                size=100,
+            )
+            if screen and "quotes" in screen:
+                tickers = [
+                    q["symbol"] for q in screen["quotes"]
+                    if _is_valid_us_ticker(q.get("symbol", ""))
+                ]
+        except Exception as e:
+            st.warning(f"yfinance screener also failed ({e}). Results may be limited.")
+
+    # ── Deduplicate and cap ──────────────────────────────────────────────
+    seen = set()
+    clean = []
+    for t in tickers:
+        if t not in seen:
+            seen.add(t)
+            clean.append(t)
+    return clean[:MAX_TICKERS]
+
+
+def _is_valid_us_ticker(sym: str) -> bool:
+    """
+    Basic heuristic to exclude non-standard US tickers.
+    - Only A-Z characters (no dots, hyphens, numbers in symbol)
+    - 1–5 characters (NYSE/NASDAQ convention)
+    - Excludes common warrant/unit/right suffixes: W, WS, R, U
+    """
+    if not sym or not isinstance(sym, str):
+        return False
+    sym = sym.strip().upper()
+    if not re.fullmatch(r"[A-Z]{1,5}", sym):
+        return False
+    # Skip obvious warrants/rights
+    if sym.endswith(("W", "WS", "R", "U")) and len(sym) > 1:
+        return False
+    return True
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_ticker_detail(ticker: str) -> Optional[dict]:
+    """
+    Fetches all required fields for one ticker via yfinance.
+    Returns None on total failure; missing fields are set to None
+    so the caller can display 'N/A' gracefully.
+
+    Why fast_info + info together?
+    • fast_info is lightweight (single HTTP request) and gives price data
+    • full .info is slower but contains float/market-cap — we fetch it
+      only for tickers that pass the price + gap pre-filter
+    """
+    try:
+        t = yf.Ticker(ticker)
+        fi = t.fast_info  # fast, light-weight
+
+        prev_close   = _safe_float(fi.previous_close)
+        current_raw  = _safe_float(fi.last_price)
+        # During pre-market the "last_price" reflects the pre-market quote
+        # yfinance also exposes pre_market_price when market is closed
+        try:
+            pm_price = _safe_float(getattr(fi, "pre_market_price", None))
+        except Exception:
+            pm_price = None
+
+        current_price = pm_price if (pm_price and pm_price > 0) else current_raw
+
+        volume = _safe_float(fi.three_month_average_volume)  # placeholder
+        # Prefer today's volume from .info for accuracy
+        try:
+            day_vol = _safe_float(fi.shares) # not reliable; will overwrite below
+        except Exception:
+            day_vol = None
+
+        return {
+            "ticker":       ticker,
+            "prev_close":   prev_close,
+            "current_price": current_price,
+            "volume":       day_vol,
+            "_fi":          fi,   # pass through for info fetch
+        }
+    except Exception:
+        return None
+
+
+def fetch_full_detail(ticker: str) -> Optional[dict]:
+    """
+    Full detail fetch (float, market cap, volume) via yf.Ticker.info.
+    Cached implicitly via yfinance's own request cache.
+    Called only for tickers that survive the price/gap pre-filter.
+    """
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info
+
+        prev_close    = _safe_float(info.get("regularMarketPreviousClose") or info.get("previousClose"))
+        # Current price: prefer preMarketPrice, fall back to regularMarketPrice
+        pm_price      = _safe_float(info.get("preMarketPrice"))
+        reg_price     = _safe_float(info.get("regularMarketPrice") or info.get("currentPrice"))
+        current_price = pm_price if (pm_price and pm_price > 0) else reg_price
+
+        volume        = _safe_float(info.get("regularMarketVolume") or info.get("volume"))
+        float_shares  = _safe_float(info.get("floatShares"))
+        shares_out    = _safe_float(info.get("sharesOutstanding"))
+        market_cap    = _safe_float(info.get("marketCap"))
+        short_pct     = _safe_float(info.get("shortPercentOfFloat"))
+        avg_vol_10d   = _safe_float(info.get("averageVolume10days") or info.get("averageDailyVolume10Day"))
+        country       = info.get("country", "")
+        exchange      = info.get("exchange", "")
+        quote_type    = info.get("quoteType", "")
+
+        return {
+            "ticker":        ticker,
+            "prev_close":    prev_close,
+            "current_price": current_price,
+            "volume":        volume,
+            "float_shares":  float_shares,
+            "shares_out":    shares_out,
+            "market_cap":    market_cap,
+            "short_pct":     short_pct,
+            "avg_vol_10d":   avg_vol_10d,
+            "country":       country,
+            "exchange":      exchange,
+            "quote_type":    quote_type,
+        }
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILTER ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_filters(
+    raw: dict,
+    min_price:      float = 1.0,
+    max_price:      float = 15.0,
+    min_gap_pct:    float = 20.0,
+    min_volume:     int   = 500_000,
+    max_float:      int   = 20_000_000,
+) -> tuple[bool, str]:
+    """
+    Returns (passes: bool, reject_reason: str).
+    Fail-fast order: cheapest checks first.
+    """
+    # ── US equity only ───────────────────────────────────────────────────
+    qt = (raw.get("quote_type") or "").upper()
+    if qt and qt not in ("EQUITY", ""):
+        return False, f"Not an equity (quoteType={qt})"
+
+    country = (raw.get("country") or "").lower()
+    if country and country not in ("united states", "us", "usa", ""):
+        return False, f"Non-US domicile ({country})"
+
+    # ── Price range ──────────────────────────────────────────────────────
+    price = raw.get("current_price")
+    if price is None:
+        return False, "No price data"
+    if not (min_price <= price <= max_price):
+        return False, f"Price ${price:.2f} outside ${min_price}–${max_price}"
+
+    # ── Gap up ───────────────────────────────────────────────────────────
+    prev = raw.get("prev_close")
+    if prev is None or prev <= 0:
+        return False, "No previous close"
+    gap_pct = ((price - prev) / prev) * 100
+    if gap_pct < min_gap_pct:
+        return False, f"Gap {gap_pct:.1f}% < {min_gap_pct}% required"
+
+    # ── Volume ───────────────────────────────────────────────────────────
+    vol = raw.get("volume")
+    if vol is None:
+        pass   # Allow with N/A — don't hard-reject on missing volume
+    elif vol < min_volume:
+        return False, f"Volume {int(vol):,} < {min_volume:,}"
+
+    # ── Float ────────────────────────────────────────────────────────────
+    flt = raw.get("float_shares")
+    if flt is not None and flt > max_float:
+        return False, f"Float {_fmt_float_shares(flt)} > {_fmt_float_shares(max_float)}"
+
+    return True, ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN SCAN ORCHESTRATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_scan(
+    min_price:   float,
+    max_price:   float,
+    min_gap_pct: float,
+    min_volume:  int,
+    max_float:   int,
+    progress_bar,
+    status_text,
+) -> pd.DataFrame:
+    """
+    Full scan pipeline:
+    1. Fetch gainers list (scrape + yf fallback)
+    2. Per-ticker: fetch full detail, apply filters
+    3. Build results DataFrame
+    """
+
+    status_text.markdown(
+        '<span style="font-family:\'Space Mono\',monospace;font-size:0.75rem;'
+        'color:#00e5a0;">▶ FETCHING GAINERS LIST…</span>',
+        unsafe_allow_html=True,
+    )
+    progress_bar.progress(5)
+
+    tickers = fetch_gainer_tickers()
+    if not tickers:
+        st.error("Could not retrieve any tickers. Yahoo Finance may be blocking requests. Try again in 60 seconds.")
+        return pd.DataFrame()
+
+    total = len(tickers)
+    status_text.markdown(
+        f'<span style="font-family:\'Space Mono\',monospace;font-size:0.75rem;'
+        f'color:#00e5a0;">▶ {total} TICKERS FOUND — SCANNING…</span>',
+        unsafe_allow_html=True,
+    )
+
+    results = []
+    rejected_counts: dict[str, int] = {}
+
+    for i, ticker in enumerate(tickers):
+        pct = 5 + int((i / total) * 92)
+        progress_bar.progress(pct)
+
+        try:
+            raw = fetch_full_detail(ticker)
+            if raw is None:
+                rejected_counts["No data"] = rejected_counts.get("No data", 0) + 1
+                time.sleep(REQUEST_DELAY)
+                continue
+
+            passes, reason = apply_filters(
+                raw,
+                min_price   = min_price,
+                max_price   = max_price,
+                min_gap_pct = min_gap_pct,
+                min_volume  = min_volume,
+                max_float   = max_float,
+            )
+
+            if not passes:
+                cat = reason.split(" ")[0] if reason else "Other"
+                rejected_counts[cat] = rejected_counts.get(cat, 0) + 1
+                time.sleep(REQUEST_DELAY)
+                continue
+
+            # ── All filters passed → record result ───────────────────────
+            price      = raw["current_price"]
+            prev_close = raw["prev_close"]
+            gap_pct    = ((price - prev_close) / prev_close) * 100
+
+            float_shares = raw.get("float_shares")
+            float_tier   = (
+                "🔥 PREMIUM"  if (float_shares and float_shares < 5_000_000) else
+                "✅ LOW"      if (float_shares and float_shares < 20_000_000) else
+                "N/A"
+            )
+
+            # RVOL — relative volume vs. 10-day average
+            vol     = raw.get("volume")
+            avg_vol = raw.get("avg_vol_10d")
+            rvol    = round(vol / avg_vol, 1) if (vol and avg_vol and avg_vol > 0) else None
+
+            # Short float as % — multiply by 100 if stored as decimal
+            si_raw  = raw.get("short_pct")
+            si_pct  = None
+            if si_raw is not None:
+                si_pct = si_raw * 100 if si_raw < 1 else si_raw
+
+            results.append({
+                "Ticker":       ticker,
+                "Price":        price,
+                "Prev Close":   prev_close,
+                "Gap %":        round(gap_pct, 2),
+                "Volume":       int(vol) if vol else None,
+                "RVOL":         rvol,
+                "Float":        int(float_shares) if float_shares else None,
+                "Float Tier":   float_tier,
+                "Short %":      round(si_pct, 1) if si_pct else None,
+                "Market Cap":   raw.get("market_cap"),
+                "Exchange":     raw.get("exchange", ""),
+            })
+
+        except Exception as e:
+            rejected_counts["Error"] = rejected_counts.get("Error", 0) + 1
+
+        time.sleep(REQUEST_DELAY)
+
+    progress_bar.progress(100)
+    status_text.markdown(
+        f'<span style="font-family:\'Space Mono\',monospace;font-size:0.75rem;'
+        f'color:#00e5a0;">✓ SCAN COMPLETE — {len(results)} candidates found</span>',
+        unsafe_allow_html=True,
+    )
+
+    if not results:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(results)
+
+    # Sort: premium float first, then by gap %
+    tier_order = {"🔥 PREMIUM": 0, "✅ LOW": 1, "N/A": 2}
+    df["_tier_sort"] = df["Float Tier"].map(tier_order)
+    df = df.sort_values(["_tier_sort", "Gap %"], ascending=[True, False]).drop("_tier_sort", axis=1)
+    df = df.reset_index(drop=True)
+
+    # Store rejection stats in session state for display
+    st.session_state["last_rejected"] = rejected_counts
+    st.session_state["last_scan_time"] = datetime.now().strftime("%H:%M:%S")
+    st.session_state["last_ticker_count"] = total
+
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DISPLAY HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def style_dataframe(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    """
+    Apply color-coding:
+    • Rows where Float < 5M → amber highlight (premium setup)
+    • Gap % column → green gradient
+    • RVOL column → green gradient
+    """
+
+    def highlight_row(row):
+        flt = row.get("Float")
+        base = "background-color: #0d1520; color: #e8f0fe;"
+        if flt is not None and flt < 5_000_000:
+            return [
+                "background-color: #1a1500; border-left: 3px solid #ffb800; color: #ffe082;"
+            ] * len(row)
+        return [base] * len(row)
+
+    def color_gap(val):
+        if val is None or not isinstance(val, (int, float)): return ""
+        if val >= 100: return "color: #ff4560; font-weight: 700;"
+        if val >= 50:  return "color: #ffb800; font-weight: 700;"
+        if val >= 20:  return "color: #00e5a0; font-weight: 600;"
+        return "color: #7a9ab8;"
+
+    def color_rvol(val):
+        if val is None or not isinstance(val, (int, float)): return ""
+        if val >= 10:  return "color: #ff4560; font-weight: 700;"
+        if val >= 5:   return "color: #ffb800; font-weight: 600;"
+        return "color: #7a9ab8;"
+
+    # Build display copy with formatted strings
+    disp = df.copy()
+    disp["Price"]      = disp["Price"].apply(_fmt_currency)
+    disp["Prev Close"] = disp["Prev Close"].apply(_fmt_currency)
+    disp["Gap %"]      = disp["Gap %"].apply(lambda x: f"+{x:.1f}%" if x else "N/A")
+    disp["Volume"]     = disp["Volume"].apply(_fmt_volume)
+    disp["RVOL"]       = disp["RVOL"].apply(lambda x: f"{x:.1f}x" if x else "N/A")
+    disp["Float"]      = disp["Float"].apply(_fmt_float_shares)
+    disp["Short %"]    = disp["Short %"].apply(lambda x: f"{x:.1f}%" if x else "N/A")
+    disp["Market Cap"] = disp["Market Cap"].apply(_fmt_market_cap)
+
+    styler = (
+        disp.style
+        .apply(highlight_row, axis=1)
+        .applymap(color_gap,  subset=["Gap %"])
+        .applymap(color_rvol, subset=["RVOL"])
+        .set_properties(**{
+            "font-family":  "'Space Mono', monospace",
+            "font-size":    "0.75rem",
+            "border":       "1px solid #1a2d45",
+            "padding":      "6px 12px",
+        })
+        .set_table_styles([
+            {
+                "selector": "th",
+                "props": [
+                    ("background-color", "#0d1520"),
+                    ("color", "#7a9ab8"),
+                    ("font-family", "'Space Mono', monospace"),
+                    ("font-size", "0.65rem"),
+                    ("letter-spacing", "0.12em"),
+                    ("text-transform", "uppercase"),
+                    ("border-bottom", "2px solid #1f3a56"),
+                    ("padding", "8px 12px"),
+                ]
+            },
+            {
+                "selector": "td",
+                "props": [("border-color", "#1a2d45")]
+            },
+        ])
+    )
+    return styler
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR — SCAN PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+with st.sidebar:
+    st.markdown(
+        '<p style="font-family:\'Space Mono\',monospace;font-size:0.6rem;'
+        'color:#3d5a73;letter-spacing:0.18em;text-transform:uppercase;'
+        'margin-bottom:0.5rem;">SCAN PARAMETERS</p>',
+        unsafe_allow_html=True,
+    )
+
+    min_price = st.slider("Min Price ($)", 0.5, 5.0, 1.0, 0.5)
+    max_price = st.slider("Max Price ($)", 5.0, 30.0, 15.0, 1.0)
+    min_gap   = st.slider("Min Gap Up (%)", 10, 100, 20, 5)
+    min_vol   = st.select_slider(
+        "Min Volume",
+        options=[100_000, 250_000, 500_000, 750_000, 1_000_000, 2_000_000],
+        value=500_000,
+        format_func=_fmt_volume,
+    )
+    max_float = st.select_slider(
+        "Max Float (shares)",
+        options=[1_000_000, 2_000_000, 5_000_000, 10_000_000, 20_000_000, 50_000_000],
+        value=20_000_000,
+        format_func=_fmt_float_shares,
+    )
+
+    st.divider()
+    st.markdown(
+        '<p style="font-family:\'Space Mono\',monospace;font-size:0.6rem;'
+        'color:#3d5a73;letter-spacing:0.15em;">DATA SOURCE</p>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<p style="font-family:\'Space Mono\',monospace;font-size:0.65rem;'
+        'color:#7a9ab8;">Yahoo Finance (yfinance)<br/>No API key required</p>',
+        unsafe_allow_html=True,
+    )
+    st.divider()
+    st.markdown(
+        '<p style="font-family:\'Space Mono\',monospace;font-size:0.55rem;'
+        'color:#3d5a73;line-height:1.6;">⚠ For educational use only.<br/>'
+        'Not financial advice. Data may<br/>be delayed 15–20 min.</p>',
+        unsafe_allow_html=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MASTHEAD
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.markdown("""
+<div class="masthead">
+  <span class="masthead-title">GAP & GO</span>
+  <span class="masthead-sub">Pre-Market Scanner</span>
+  <span style="flex:1;"></span>
+  <span class="ticker-badge">US EQUITIES ONLY</span>
+  <span class="ticker-badge">READ-ONLY</span>
+</div>
+""", unsafe_allow_html=True)
+
+now_et = datetime.now()  # Server time (cloud is UTC; note this)
+col_date, col_time, col_spacer = st.columns([2, 2, 6])
+col_date.markdown(
+    f'<span style="font-family:\'Space Mono\',monospace;font-size:0.65rem;'
+    f'color:#3d5a73;">{now_et.strftime("%A, %B %d %Y")}</span>',
+    unsafe_allow_html=True,
+)
+col_time.markdown(
+    f'<span style="font-family:\'Space Mono\',monospace;font-size:0.65rem;'
+    f'color:#3d5a73;">{now_et.strftime("%H:%M:%S")} UTC</span>',
+    unsafe_allow_html=True,
+)
+
+st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCAN TRIGGER
+# ─────────────────────────────────────────────────────────────────────────────
+
+col_btn, col_status = st.columns([2, 8])
+with col_btn:
+    scan_clicked = st.button("⬡  SCAN PRE-MARKET", use_container_width=True)
+
+status_placeholder = col_status.empty()
+progress_placeholder = st.empty()
+
+if scan_clicked:
+    progress_bar = progress_placeholder.progress(0)
+    df_results = run_scan(
+        min_price   = min_price,
+        max_price   = max_price,
+        min_gap_pct = min_gap,
+        min_volume  = min_vol,
+        max_float   = max_float,
+        progress_bar = progress_bar,
+        status_text  = status_placeholder,
+    )
+    st.session_state["scan_results"] = df_results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESULTS DISPLAY
+# ─────────────────────────────────────────────────────────────────────────────
+
+if "scan_results" in st.session_state and st.session_state["scan_results"] is not None:
+    df = st.session_state["scan_results"]
+
+    # ── KPI row ────────────────────────────────────────────────────────
+    st.markdown("<div style='height:12px;'></div>", unsafe_allow_html=True)
+    k1, k2, k3, k4, k5 = st.columns(5)
+
+    last_time  = st.session_state.get("last_scan_time", "—")
+    total_seen = st.session_state.get("last_ticker_count", 0)
+    n_results  = len(df)
+    n_premium  = len(df[df["Float Tier"] == "🔥 PREMIUM"]) if not df.empty else 0
+    top_gap    = df["Gap %"].max() if not df.empty and "Gap %" in df.columns else None
+
+    with k1:
+        st.metric("SCAN TIME (UTC)", last_time)
+    with k2:
+        st.metric("TICKERS SCANNED", f"{total_seen:,}")
+    with k3:
+        st.metric("CANDIDATES", n_results)
+    with k4:
+        st.metric("PREMIUM SETUPS", n_premium, help="Float < 5M shares")
+    with k5:
+        st.metric("TOP GAP", f"+{top_gap:.1f}%" if top_gap else "—")
+
+    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+
+    if df.empty:
+        st.markdown(
+            '<div style="background:#0d1520;border:1px solid #1a2d45;border-left:3px solid #ff4560;'
+            'padding:16px 20px;border-radius:3px;font-family:\'Space Mono\',monospace;font-size:0.75rem;'
+            'color:#7a9ab8;">NO CANDIDATES FOUND matching current filter criteria.<br/>'
+            'Consider loosening the Gap % or Volume thresholds, or wait until pre-market activity increases.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        # ── Legend ────────────────────────────────────────────────────
+        st.markdown(
+            '<div style="display:flex;gap:12px;margin-bottom:8px;align-items:center;">'
+            '<span style="font-family:\'Space Mono\',monospace;font-size:0.6rem;color:#3d5a73;'
+            'letter-spacing:0.12em;text-transform:uppercase;">FLOAT TIER:</span>'
+            '<span style="font-size:0.7rem;background:rgba(255,184,0,0.12);border:1px solid #ffb800;'
+            'color:#ffb800;padding:2px 8px;border-radius:2px;font-family:\'Space Mono\',monospace;">'
+            '🔥 PREMIUM — &lt;5M shares</span>'
+            '<span style="font-size:0.7rem;background:rgba(0,229,160,0.08);border:1px solid rgba(0,229,160,0.3);'
+            'color:#00e5a0;padding:2px 8px;border-radius:2px;font-family:\'Space Mono\',monospace;">'
+            '✅ LOW — 5M–20M shares</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        # ── Styled table ──────────────────────────────────────────────
+        styled = style_dataframe(df)
+        st.dataframe(
+            styled,
+            use_container_width = True,
+            hide_index          = True,
+            height              = min(600, 55 + len(df) * 38),
+        )
+
+        # ── Download ──────────────────────────────────────────────────
+        csv = df.to_csv(index=False)
+        dl_col, _ = st.columns([2, 8])
+        dl_col.download_button(
+            label    = "⬇  EXPORT CSV",
+            data     = csv,
+            file_name = f"gap_go_scan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime     = "text/csv",
+        )
+
+        # ── Rejection breakdown ───────────────────────────────────────
+        rejected = st.session_state.get("last_rejected", {})
+        if rejected:
+            with st.expander("📊  Filter rejection breakdown"):
+                rdf = pd.DataFrame(
+                    {"Reason": list(rejected.keys()), "Count": list(rejected.values())}
+                ).sort_values("Count", ascending=False)
+                st.dataframe(rdf, use_container_width=True, hide_index=True, height=200)
+
+else:
+    # ── Welcome state ───────────────────────────────────────────────────
+    st.markdown("""
+    <div style="margin-top:2rem;background:#0d1520;border:1px solid #1a2d45;
+    border-left:3px solid #00e5a0;padding:24px 28px;border-radius:3px;
+    max-width:680px;">
+      <p style="font-family:'Space Mono',monospace;font-size:0.65rem;
+      color:#3d5a73;letter-spacing:0.15em;text-transform:uppercase;margin-bottom:12px;">
+      HOW TO USE</p>
+      <p style="font-family:'Space Mono',monospace;font-size:0.75rem;color:#7a9ab8;
+      line-height:1.8;margin:0;">
+      1. Adjust scan parameters in the sidebar (or use defaults).<br/>
+      2. Press <span style="color:#00e5a0;font-weight:700;">SCAN PRE-MARKET</span>
+         during the 4:00–9:30 AM ET pre-market window.<br/>
+      3. Review candidates sorted by Float Tier → Gap %.<br/>
+      4. 🔥 <span style="color:#ffb800;font-weight:700;">PREMIUM</span> rows =
+         float &lt; 5M shares (highest momentum potential).<br/>
+      5. Export results to CSV for further analysis.
+      </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div style="margin-top:1rem;background:#0d1520;border:1px solid #1a2d45;
+    border-top:2px solid #1f3a56;padding:20px 28px;border-radius:3px;max-width:680px;">
+      <p style="font-family:'Space Mono',monospace;font-size:0.65rem;
+      color:#3d5a73;letter-spacing:0.15em;text-transform:uppercase;margin-bottom:10px;">
+      SCAN CRITERIA ACTIVE</p>
+      <p style="font-family:'Space Mono',monospace;font-size:0.72rem;color:#7a9ab8;
+      line-height:2.0;margin:0;">
+      ▸ US Equities Only (NYSE / NASDAQ / AMEX)<br/>
+      ▸ Price: $1.00 – $15.00<br/>
+      ▸ Pre-Market Gap Up: ≥ +20%<br/>
+      ▸ Volume: &gt; 500,000 shares<br/>
+      ▸ Float: &lt; 20,000,000 shares
+      </p>
+    </div>
+    """, unsafe_allow_html=True)
