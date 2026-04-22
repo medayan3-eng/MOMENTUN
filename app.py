@@ -10,13 +10,10 @@ import time
 import warnings
 from datetime import datetime, date
 from typing import Optional
-import re
 
 import pandas as pd
-import requests
 import streamlit as st
 import yfinance as yf
-from bs4 import BeautifulSoup
 
 warnings.filterwarnings("ignore")
 
@@ -229,17 +226,51 @@ body::before {
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS & DEFAULTS
 # ─────────────────────────────────────────────────────────────────────────────
-YF_GAINERS_URL  = "https://finance.yahoo.com/markets/stocks/gainers/"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
-REQUEST_DELAY   = 0.35   # seconds between yfinance calls — polite pacing
-MAX_TICKERS     = 150    # max tickers to detail-fetch from the gainers list
+REQUEST_DELAY = 0.35   # seconds between yfinance calls — polite pacing
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HARDCODED TICKER UNIVERSE
+# Source: Finviz Screener — filters applied:
+#   cap:microunder | geo:usa | sh_avgvol:o500 | sh_float:u20 | sh_price:1to15
+# 163 US micro-cap tickers, float < 20M, avg vol > 500K, price $1–$15
+# Update this list periodically from Finviz to keep the universe fresh.
+# ─────────────────────────────────────────────────────────────────────────────
+FINVIZ_UNIVERSE = [
+    # 1–20
+    "ADTX", "AGAE", "AGH",  "AGIG", "AIB",  "AIFF", "AIM",  "AIMD",
+    "AIRS", "ALBT", "AMOD", "ANNA", "ANY",  "APRE", "ARAI", "ARTL",
+    "ASBP", "ASTC", "ASTI", "AUID",
+    # 21–40
+    "AZTR", "BATL", "BCG",  "BENF", "BFRG", "BIAF", "BIRD", "BKKT",
+    "BKYI", "BNBX", "BNZI", "BOXL", "BRN",  "BTBD", "BTOC", "BYRN",
+    "CALC", "CAPS", "CDIO", "CETX",
+    # 41–60
+    "CETY", "CLDI", "COCP", "CODX", "CURX", "CYCN", "CYCU", "CYN",
+    "DBGI", "DEVS", "DRCT", "DRMA", "EDBL", "EEIQ", "EFOI", "ELAB",
+    "EMPD", "ENSC", "ENVB", "EVTV",
+    # 61–80
+    "EZRA", "FATN", "FCUV", "FEED", "FLYX", "FRGT", "FRMM", "FUSE",
+    "GBR",  "GCTK", "GIPR", "GLND", "GNPX", "GWH",  "GXAI", "HCTI",
+    "HCWB", "HIND", "HOTH", "IPST",
+    # 81–100
+    "IPW",  "IVDA", "JACK", "JAGX", "KAPA", "KIDZ", "KITT", "KPRX",
+    "KSCP", "LASE", "LGVN", "LIMN", "LNAI", "LOCL", "LRHC", "LTRN",
+    "MAMO", "MEHA", "MGRX", "MIGI",
+    # 101–120
+    "MNTS", "MRAM", "MSS",  "MYSE", "MYXXU","NUWE", "NVVE", "NXL",
+    "OBAI", "OGEN", "OLB",  "OLOX", "ONCO", "ONFO", "ONMD", "OSRH",
+    "PBM",  "PFSA", "PHGE", "PHIO",
+    # 121–140
+    "PLYX", "POLA", "PRSO", "QCLS", "QNCX", "QVCGA","RENX", "REVB",
+    "RIME", "RMSG", "ROLR", "RVPH", "SBEV", "SEGG", "SER",  "SEV",
+    "SILO", "SKYQ", "SLAI", "SNAL",
+    # 141–160
+    "SNBR", "SNYR", "SOAR", "SOPA", "SOWG", "SQFT", "SST",  "SUNE",
+    "SXTP", "TBH",  "TNON", "UGRO", "USBC", "VEAA", "VEEE", "VIVS",
+    "VRME", "VTAK", "XHLD", "XPON",
+    # 161–163
+    "XWEL", "YCBD", "ZSPC",
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -282,93 +313,13 @@ def _fmt_market_cap(v) -> str:
     return f"${v:,.0f}"
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def fetch_gainer_tickers() -> list[str]:
     """
-    Scrapes Yahoo Finance 'Markets > Stocks > Gainers' page for the
-    current top-gaining US equities.
-
-    Improvements over a naïve approach:
-    • Uses a realistic User-Agent to avoid 429s
-    • Falls back to a hardcoded yfinance screener query if scraping fails
-    • Deduplicates and strips any non-equity suffixes (e.g. warrants)
-    • Filters out obvious non-US patterns (tickers containing '.' or '-' 
-      which typically denote foreign or preferred shares)
+    Returns the hardcoded Finviz universe of 163 pre-filtered US micro-cap
+    tickers (float < 20M, avg vol > 500K, price $1–$15, US only).
+    No scraping needed — no rate limits, no failures, instant return.
     """
-    tickers: list[str] = []
-
-    # ── Attempt 1: Scrape Yahoo Finance gainers page ────────────────────
-    try:
-        resp = requests.get(YF_GAINERS_URL, headers=HEADERS, timeout=15)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            # Yahoo Finance renders tickers in <a> tags or data-symbol attrs
-            # Try data-symbol first (most reliable across page revisions)
-            found = set()
-            for tag in soup.find_all(attrs={"data-symbol": True}):
-                sym = tag["data-symbol"].strip().upper()
-                if _is_valid_us_ticker(sym):
-                    found.add(sym)
-
-            # Fallback: scan all <a> hrefs for /quote/TICKER pattern
-            if not found:
-                for a in soup.find_all("a", href=True):
-                    m = re.search(r"/quote/([A-Z]{1,5})(?:\?|/|$)", a["href"])
-                    if m:
-                        sym = m.group(1)
-                        if _is_valid_us_ticker(sym):
-                            found.add(sym)
-
-            tickers = list(found)[:MAX_TICKERS]
-
-    except Exception as e:
-        st.warning(f"Yahoo scrape attempt failed ({e}). Trying backup method…")
-
-    # ── Attempt 2: yfinance built-in screener (backup) ──────────────────
-    if not tickers:
-        try:
-            screen = yf.screen(
-                "day_gainers",
-                sortField="percentChange",
-                sortAsc=False,
-                offset=0,
-                size=100,
-            )
-            if screen and "quotes" in screen:
-                tickers = [
-                    q["symbol"] for q in screen["quotes"]
-                    if _is_valid_us_ticker(q.get("symbol", ""))
-                ]
-        except Exception as e:
-            st.warning(f"yfinance screener also failed ({e}). Results may be limited.")
-
-    # ── Deduplicate and cap ──────────────────────────────────────────────
-    seen = set()
-    clean = []
-    for t in tickers:
-        if t not in seen:
-            seen.add(t)
-            clean.append(t)
-    return clean[:MAX_TICKERS]
-
-
-def _is_valid_us_ticker(sym: str) -> bool:
-    """
-    Basic heuristic to exclude non-standard US tickers.
-    - Only A-Z characters (no dots, hyphens, numbers in symbol)
-    - 1–5 characters (NYSE/NASDAQ convention)
-    - Excludes common warrant/unit/right suffixes: W, WS, R, U
-    """
-    if not sym or not isinstance(sym, str):
-        return False
-    sym = sym.strip().upper()
-    if not re.fullmatch(r"[A-Z]{1,5}", sym):
-        return False
-    # Skip obvious warrants/rights
-    if sym.endswith(("W", "WS", "R", "U")) and len(sym) > 1:
-        return False
-    return True
+    return list(FINVIZ_UNIVERSE)
 
 
 @st.cache_data(ttl=120, show_spinner=False)
