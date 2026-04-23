@@ -359,82 +359,57 @@ def fetch_gainer_tickers() -> list[str]:
     return list(FINVIZ_UNIVERSE)
 
 
+def _fetch_fast_info_single(ticker: str) -> Optional[dict]:
+    """
+    Lightweight per-ticker fetch using fast_info.
+    fast_info makes a single small HTTP request (not a heavy batch download).
+    last_price reflects pre-market price during pre-market hours. ✓
+    """
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        prev_close    = _safe_float(fi.previous_close)
+        current_price = _safe_float(fi.last_price)
+        volume        = _safe_float(fi.last_volume)
+        if prev_close and current_price:
+            return {
+                "prev_close":    prev_close,
+                "current_price": current_price,
+                "volume":        volume,
+            }
+        return None
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def batch_fetch_prices(tickers: tuple) -> pd.DataFrame:
     """
-    Phase 1 — FAST batch price fetch for all tickers in two calls:
+    Phase 1 — parallel fast_info for all tickers (25 threads).
 
-    Call A → daily bars (5d)  : gives yesterday's official closing price (prev_close)
-    Call B → 2-min bars (1d, prepost=True) : gives the CURRENT price including
-             pre-market prints (05:07 ET = active pre-market)
-
-    This is the correct approach during pre-market hours.
-    A single daily download was returning yesterday vs day-before,
-    causing gap% = ~0 for every ticker → 0 candidates.
+    Why not yf.download()?
+    • yf.download() with 195 tickers in one call times out / gets blocked
+      on Streamlit Cloud's shared IPs.
+    • fast_info is a tiny per-ticker request (~1 KB vs ~500 KB for batch).
+    • 25 threads × ~195 tickers ≈ 8 rounds ≈ 5–10 seconds total.
+    • last_price correctly reflects pre-market price during pre-market. ✓
     """
-    try:
-        ticker_list = list(tickers)
+    results = {}
+    ticker_list = list(tickers)
 
-        # ── Call A: previous close (last completed regular session) ──────
-        daily = yf.download(
-            ticker_list,
-            period      = "5d",
-            interval    = "1d",
-            auto_adjust = True,
-            progress    = False,
-            threads     = True,
-        )
-
-        # ── Call B: current price including pre-market ───────────────────
-        intraday = yf.download(
-            ticker_list,
-            period      = "1d",
-            interval    = "2m",
-            prepost     = True,   # ← includes pre-market & after-hours bars
-            auto_adjust = True,
-            progress    = False,
-            threads     = True,
-        )
-
-        if daily.empty:
-            return pd.DataFrame()
-
-        daily_close    = daily["Close"]
-        intraday_close = intraday["Close"] if not intraday.empty else pd.DataFrame()
-        daily_volume   = daily["Volume"]
-
-        results = {}
-        for ticker in ticker_list:
+    with ThreadPoolExecutor(max_workers=25) as pool:
+        futures = {pool.submit(_fetch_fast_info_single, t): t for t in ticker_list}
+        for future in as_completed(futures):
+            ticker = futures[future]
             try:
-                # prev_close = last completed daily bar close
-                d_closes = daily_close[ticker].dropna() if ticker in daily_close else pd.Series(dtype=float)
-                if d_closes.empty:
-                    continue
-                prev_close = float(d_closes.iloc[-1])
-
-                # current_price = latest pre-market bar (or fall back to prev_close)
-                if not intraday_close.empty and ticker in intraday_close:
-                    i_closes = intraday_close[ticker].dropna()
-                    current_price = float(i_closes.iloc[-1]) if not i_closes.empty else prev_close
-                else:
-                    current_price = prev_close
-
-                # volume = latest daily volume
-                d_vols = daily_volume[ticker].dropna() if ticker in daily_volume else pd.Series(dtype=float)
-                vol = float(d_vols.iloc[-1]) if not d_vols.empty else None
-
-                results[ticker] = {
-                    "prev_close":    prev_close,
-                    "current_price": current_price,
-                    "volume":        vol,
-                }
+                data = future.result()
+                if data:
+                    results[ticker] = data
             except Exception:
-                continue
+                pass
 
-        return pd.DataFrame(results).T
-
-    except Exception:
+    if not results:
         return pd.DataFrame()
+    return pd.DataFrame(results).T
 
 
 def fetch_full_detail(ticker: str) -> Optional[dict]:
