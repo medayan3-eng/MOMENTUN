@@ -323,9 +323,61 @@ TICKER_UNIVERSE = [
 ]
 
 
+def _fetch_dynamic_gainers() -> list[str]:
+    """
+    Pulls TODAY's actual top gainers from Yahoo Finance.
+    Returns up to 200 tickers that are actually moving right now.
+
+    Three methods tried in order:
+    1. yf.screen("day_gainers")  — cleanest, single API call
+    2. Yahoo Finance gainers URL scrape — backup
+    3. Empty list — fall back to static universe only
+    """
+    import re as _re
+
+    tickers: list[str] = []
+
+    # ── Method 1: yfinance built-in screener ─────────────────────────────
+    try:
+        result = yf.screen("day_gainers", size=100)
+        if result and "quotes" in result:
+            for q in result["quotes"]:
+                sym = (q.get("symbol") or "").strip().upper()
+                if _re.fullmatch(r"[A-Z]{1,5}", sym):
+                    tickers.append(sym)
+    except Exception:
+        pass
+
+    # ── Method 2: Yahoo Finance HTML scrape ──────────────────────────────
+    if not tickers:
+        try:
+            import urllib.request
+            url = "https://finance.yahoo.com/markets/stocks/gainers/?start=0&count=100"
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 Chrome/124 Safari/537.36"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+            for m in _re.finditer(r'"symbol":"([A-Z]{1,5})"', html):
+                sym = m.group(1)
+                if sym not in tickers:
+                    tickers.append(sym)
+        except Exception:
+            pass
+
+    return tickers[:200]
+
+
 def fetch_gainer_tickers() -> list[str]:
-    """Returns the curated universe. Deduplicated and sorted."""
-    return sorted(set(TICKER_UNIVERSE))
+    """
+    Hybrid universe: TODAY's real movers + curated static list.
+    Dynamic gainers come first so they're prioritised in the scan.
+    """
+    dynamic  = _fetch_dynamic_gainers()
+    static   = list(TICKER_UNIVERSE)
+    combined = list(dict.fromkeys(dynamic + static))  # dedupe, preserve order
+    return combined
 
 
 def _quick_price(ticker: str) -> Optional[dict]:
@@ -357,9 +409,12 @@ def run_scan(min_price, max_price, min_gap_pct, min_volume, max_float,
 
     msg("▶ LOADING UNIVERSE…")
     progress_bar.progress(2)
-    tickers = fetch_gainer_tickers()
+    dynamic_tickers = _fetch_dynamic_gainers()
+    static_tickers  = list(TICKER_UNIVERSE)
+    tickers = list(dict.fromkeys(dynamic_tickers + static_tickers))
     total   = len(tickers)
-    msg(f"▶ PHASE 1/2 — PRICE SCAN ({total:,} tickers)…")
+    n_dyn   = len(dynamic_tickers)
+    msg(f"▶ SCANNING {total:,} tickers ({n_dyn} live gainers + {len(static_tickers)} universe)…")
     progress_bar.progress(5)
 
     pre_pass: list       = []
