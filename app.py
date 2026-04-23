@@ -14,7 +14,6 @@ from io import StringIO
 from typing import Optional
 
 import pandas as pd
-import requests
 import streamlit as st
 import yfinance as yf
 
@@ -266,121 +265,65 @@ def _fmt_market_cap(v) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DYNAMIC UNIVERSE — NASDAQ Trader FTP (updated daily, ~5,000+ US stocks)
+# TICKER UNIVERSE — 298 tickers
+# Source A (266): Finviz screener — cap:microunder | geo:usa |
+#                 sh_avgvol:o500 | sh_float:u50 | sh_price:under$20
+# Source B  (32): Manual additions from 22/04 gainers/losers ($1–$20)
+# Duplicates removed. Update periodically from Finviz.
 # ─────────────────────────────────────────────────────────────────────────────
-# Two official NASDAQ pipe-delimited files list every exchange-listed US stock:
-#   nasdaqlisted.txt  — NASDAQ (NMS + Small Cap + Capital Market)
-#   otherlisted.txt   — NYSE, AMEX, ARCA, BATS
-# Together they cover ~7,000 symbols; after filtering ~4,000 common stocks.
-# Cached for 6 hours so the universe refreshes once per trading day.
-
-NASDAQ_FILE_URL = "https://ftp.nasdaqtrader.com/dynamic/SymbolDirectory/nasdaqlisted.txt"
-OTHER_FILE_URL  = "https://ftp.nasdaqtrader.com/dynamic/SymbolDirectory/otherlisted.txt"
-
-# Fallback: the 195 manually curated tickers used before, in case both URLs fail
-FALLBACK_UNIVERSE = [
-    "ADTX","AGAE","AGH","AGIG","AIB","AIFF","AIM","AIMD","AIRS","ALBT",
-    "AMOD","ANNA","ANY","APRE","ARAI","ARTL","ASBP","ASTC","ASTI","AUID",
-    "AZTR","BATL","BCG","BENF","BFRG","BIAF","BIRD","BKKT","BKYI","BNBX",
-    "BNZI","BOXL","BRN","BTBD","BTOC","BYRN","CALC","CAPS","CDIO","CETX",
-    "CETY","CLDI","COCP","CODX","CURX","CYCN","CYCU","CYN","DBGI","DEVS",
-    "DRCT","DRMA","EDBL","EEIQ","EFOI","ELAB","EMPD","ENSC","ENVB","EVTV",
-    "EZRA","FATN","FCUV","FEED","FLYX","FRGT","FRMM","FUSE","GBR","GCTK",
-    "GIPR","GLND","GNPX","GWH","GXAI","HCTI","HCWB","HIND","HOTH","IPST",
-    "IPW","IVDA","JACK","JAGX","KAPA","KIDZ","KITT","KPRX","KSCP","LASE",
-    "LGVN","LIMN","LNAI","LOCL","LRHC","LTRN","MAMO","MEHA","MGRX","MIGI",
-    "MNTS","MRAM","MSS","MYSE","NUWE","NVVE","NXL","OBAI","OGEN","OLB",
-    "OLOX","ONCO","ONFO","ONMD","OSRH","PBM","PFSA","PHGE","PHIO","PLYX",
-    "POLA","PRSO","QCLS","QNCX","RENX","REVB","RIME","RMSG","ROLR","RVPH",
-    "SBEV","SEGG","SER","SEV","SILO","SKYQ","SNAL","SNBR","SNYR","SOAR",
-    "SOPA","SOWG","SQFT","SST","SUNE","SXTP","TBH","TNON","UGRO","USBC",
-    "VEAA","VEEE","VIVS","VRME","VTAK","XHLD","XPON","XWEL","YCBD","ZSPC",
-    "AKAN","AGPU","TORO","ELPW","HCAI","BEEM","GNLN","BTM","TRUG","NUCL",
-    "LWLG","PLRZ","TRT","HELP","NVTS","WSHP","WTI","CGC","ACTU","CVV",
-    "REPL","NSRX","STI","FGI","SRAD","VTIX","NN","AMST","PALI","SMX",
+TICKER_UNIVERSE = [
+    # ── Finviz 266 (1–20) ────────────────────────────────────────────────
+    "ACRV","ACXP","ADTX","AGAE","AGEN","AGH", "AGIG","AIB", "AIFF","AIM",
+    "AIMD","AIRO","AIRS","AISP","ALBT","AMOD","AMPG","AMPY","AMZE","ANGI",
+    # 21–40
+    "ANNA","ANTX","ANVS","ANY", "APRE","ARAI","ARQ", "ARTL","ASBP","ASTC",
+    "ASTI","ATOM","AUID","AZTR","BAER","BATL","BBGI","BCG", "BDTX","BEAT",
+    # 41–60
+    "BENF","BFRG","BIAF","BIRD","BKKT","BKYI","BLNE","BNBX","BNZI","BOXL",
+    "BRN", "BRTX","BTAI","BTBD","BTCS","BTOC","BYRN","CALC","CAPS","CBUS",
+    # 61–80
+    "CCLD","CDIO","CETX","CETY","CING","CLDI","CNTN","COCH","COCP","CODX",
+    "CTNT","CTXR","CURV","CURX","CVGI","CXAI","CYCN","CYCU","CYN", "DAIC",
+    # 81–100
+    "DBGI","DEVS","DFDV","DFNS","DHX", "DOMO","DRCT","DRMA","DUOT","EDBL",
+    "EEIQ","EFOI","EHTH","ELAB","EMPD","ENSC","ENVB","EONR","EQ",  "ERNA",
+    # 101–120
+    "EVTV","EZRA","FATN","FBIO","FCUV","FEED","FLNA","FLWS","FLYX","FNKO",
+    "FRGT","FRMM","FUSE","GANX","GBR", "GCTK","GIPR","GLND","GNPX","GRCE",
+    # 121–140
+    "GSIT","GTBP","GWH", "GXAI","HCTI","HCWB","HIND","HOTH","HURA","IBIO",
+    "IPW", "ISPC","IVDA","JACK","JAGX","KAPA","KIDZ","KITT","KPRX","KPTI",
+    # 141–160
+    "KSCP","KULR","LASE","LFMD","LGVN","LIDR","LIMN","LNAI","LOCL","LTRN",
+    "LTRX","MAMO","MDAI","MEHA","MGRX","MIGI","MNTS","MOBX","MOVE","MSS",
+    # 161–180
+    "MYSE","MYXXU","NEOV","NIXX","NNBR","NOTV","NRDY","NRXP","NUWE","NVVE",
+    "NXL", "OBAI","OLB", "OLOX","OMEX","ONCO","ONFO","ONMD","OPAD","OPRT",
+    # 181–200
+    "OSG", "OSRH","OSS", "OSTX","PBM", "PFSA","PHGE","PHIO","PLYX","PMI",
+    "PMNT","PMVP","POLA","PROP","PRSO","PSQH","QCLS","QNCX","QTRX","QVCGA",
+    # 201–220
+    "RANI","RENX","REVB","RILY","RIME","RMSG","ROLR","RVPH","RWAY","SABS",
+    "SBEV","SCNX","SCYX","SEGG","SER", "SEV", "SGMT","SILO","SITC","SKYE",
+    # 221–240
+    "SKYQ","SLAI","SNAL","SNBR","SNYR","SOAR","SOPA","SOWG","SPWH","SQFT",
+    "SST", "STIM","SUNE","SXTP","TARA","TBH", "TCRX","TEAD","THRY","TLYS",
+    # 241–260
+    "TMCI","TNON","TOVX","TPET","TTEC","UGRO","UNCY","USBC","USEG","VEAA",
+    "VEEE","VIVS","VRME","VSEE","VTAK","VTGN","VYGR","WGRX","XHLD","XPON",
+    # 261–266
+    "XTIA","XWEL","YCBD","YYAI","ZNTL","ZSPC",
+    # ── Manual additions 22/04 (not in Finviz list above) ────────────────
+    "AKAN","AGPU","TORO","ELPW","HCAI","BEEM","GNLN","BTM", "TRUG","NUCL",
+    "LWLG","PLRZ","TRT", "HELP","NVTS","WSHP","WTI", "CGC", "ACTU","CVV",
+    "REPL","NSRX","STI", "FGI", "SRAD","VTIX","NN",  "AMST","PALI","SMX",
     "CAST","TMDE",
 ]
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 Chrome/124 Safari/537.36"
-    )
-}
 
-
-@st.cache_data(ttl=3600 * 6, show_spinner=False)
 def fetch_gainer_tickers() -> list[str]:
-    """
-    Downloads ALL US-listed common stocks from NASDAQ's official symbol files.
-    Returns a deduplicated list of clean 1-5 letter tickers.
-
-    Filters applied at build time:
-    • Excludes test issues (Test Issue == 'Y')
-    • Excludes ETFs (ETF == 'Y')
-    • Excludes warrants, units, rights (symbol ends with W/WS/R/U or contains $)
-    • Keeps only symbols matching [A-Z]{1,5}
-
-    Result: ~4,000–5,000 common stocks, cached for 6 hours.
-    Falls back to the 195-ticker manual list if both URLs fail.
-    """
-    import re
-    tickers: set[str] = set()
-
-    def clean_sym(s: str) -> Optional[str]:
-        if not isinstance(s, str):
-            return None
-        s = s.strip().upper()
-        if not re.fullmatch(r'[A-Z]{1,5}', s):
-            return None
-        if s.endswith(("W", "WS", "R", "U")) and len(s) > 1:
-            return None
-        return s
-
-    # ── NASDAQ listed ────────────────────────────────────────────────────
-    try:
-        resp = requests.get(NASDAQ_FILE_URL, headers=HEADERS, timeout=15)
-        if resp.status_code == 200:
-            df = pd.read_csv(StringIO(resp.text), sep='|')
-            # Drop the last summary row (starts with "File Creation Time")
-            df = df[~df["Symbol"].astype(str).str.startswith("File")]
-            # Filter out test issues and ETFs
-            if "Test Issue" in df.columns:
-                df = df[df["Test Issue"] != "Y"]
-            if "ETF" in df.columns:
-                df = df[df["ETF"] != "Y"]
-            for sym in df["Symbol"]:
-                clean = clean_sym(sym)
-                if clean:
-                    tickers.add(clean)
-    except Exception:
-        pass
-
-    # ── NYSE / AMEX / ARCA (otherlisted) ────────────────────────────────
-    try:
-        resp = requests.get(OTHER_FILE_URL, headers=HEADERS, timeout=15)
-        if resp.status_code == 200:
-            df = pd.read_csv(StringIO(resp.text), sep='|')
-            df = df[~df["ACT Symbol"].astype(str).str.startswith("File")]
-            if "Test Issue" in df.columns:
-                df = df[df["Test Issue"] != "Y"]
-            if "ETF" in df.columns:
-                df = df[df["ETF"] != "Y"]
-            # "Exchange" column: N=NYSE, A=AMEX, P=ARCA, Z=BATS, V=IEX
-            # Exclude non-US exchanges if present
-            for sym in df["ACT Symbol"]:
-                clean = clean_sym(sym)
-                if clean:
-                    tickers.add(clean)
-    except Exception:
-        pass
-
-    if not tickers:
-        # Both downloads failed — use hardcoded fallback
-        return list(FALLBACK_UNIVERSE)
-
-    result = sorted(tickers)
-    return result
+    """Returns the curated universe. Deduplicated and sorted."""
+    return sorted(set(TICKER_UNIVERSE))
 
 
 def _quick_price(ticker: str) -> Optional[dict]:
