@@ -455,7 +455,7 @@ def run_scan(min_price, max_price, min_gap_pct, min_volume, max_float,
     progress_bar.progress(100)
     msg(f"✓ DONE — {len(results)} candidates from {total:,} tickers scanned")
     st.session_state["last_rejected"]     = rejected_counts
-    st.session_state["last_scan_time"]    = datetime.now().strftime("%H:%M:%S")
+    st.session_state["last_scan_time"]    = datetime.now(ISRAEL_TZ).strftime("%H:%M:%S")
     st.session_state["last_ticker_count"] = total
     if not results:
         return pd.DataFrame()
@@ -606,21 +606,90 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-now_et = datetime.now()  # Server time (cloud is UTC; note this)
-col_date, col_time, col_spacer = st.columns([2, 2, 6])
+from datetime import timezone, timedelta
+
+# ── Israel time & session logic ───────────────────────────────────────────────
+# Israel = UTC+3 (IDT summer) / UTC+2 (IST winter)
+# We use UTC+3 (IDT) as the fixed offset — correct Apr–Oct.
+ISRAEL_TZ  = timezone(timedelta(hours=3))
+now_israel = datetime.now(ISRAEL_TZ)
+now_utc    = datetime.now(timezone.utc)
+
+# US sessions in Israel time (IDT = ET+7):
+#   Pre-market  : 04:00–09:30 ET  →  11:00–16:30 IL
+#   Regular     : 09:30–16:00 ET  →  16:30–23:00 IL
+#   After-hours : 16:00–20:00 ET  →  23:00–03:00 IL
+#   Closed      : 20:00–04:00 ET  →  03:00–11:00 IL
+
+def _get_session(dt_israel: datetime):
+    """
+    Returns (session_name, emoji, color, scan_label) based on Israel time.
+    Handles midnight wraparound for after-hours (23:00–03:00).
+    """
+    h = dt_israel.hour
+    m = dt_israel.minute
+    t = h * 60 + m  # minutes since midnight
+
+    # After-hours: 23:00–03:00 IL  (1380–1440 OR 0–180)
+    if t >= 23 * 60 or t < 3 * 60:
+        return ("AFTER-HOURS", "🌙", "#3b9eff", "⬡  SCAN AFTER-HOURS")
+    # Pre-market: 11:00–16:30 IL
+    if 11 * 60 <= t < 16 * 60 + 30:
+        return ("PRE-MARKET", "🌅", "#00e5a0", "⬡  SCAN PRE-MARKET")
+    # Regular: 16:30–23:00 IL
+    if 16 * 60 + 30 <= t < 23 * 60:
+        return ("MARKET OPEN", "📈", "#ffb800", "⬡  SCAN LIVE MARKET")
+    # Closed: 03:00–11:00 IL
+    return ("MARKET CLOSED", "💤", "#3d5a73", "⬡  SCAN (MARKET CLOSED)")
+
+session_name, session_emoji, session_color, btn_label = _get_session(now_israel)
+
+# ── Masthead time row ─────────────────────────────────────────────────────────
+col_date, col_il, col_et, col_session = st.columns([2, 2, 2, 4])
+
 col_date.markdown(
     f'<span style="font-family:\'Space Mono\',monospace;font-size:0.65rem;'
-    f'color:#3d5a73;">{now_et.strftime("%A, %B %d %Y")}</span>',
+    f'color:#3d5a73;">{now_israel.strftime("%A, %B %d %Y")}</span>',
     unsafe_allow_html=True,
 )
-col_time.markdown(
+col_il.markdown(
+    f'<span style="font-family:\'Space Mono\',monospace;font-size:0.7rem;'
+    f'color:#e8f0fe;font-weight:700;">🇮🇱 {now_israel.strftime("%H:%M:%S")}</span>',
+    unsafe_allow_html=True,
+)
+col_et.markdown(
     f'<span style="font-family:\'Space Mono\',monospace;font-size:0.65rem;'
-    f'color:#3d5a73;">{now_et.strftime("%H:%M:%S")} UTC</span>',
+    f'color:#3d5a73;">ET {(now_utc - timedelta(hours=4)).strftime("%H:%M:%S")}</span>',
+    unsafe_allow_html=True,
+)
+col_session.markdown(
+    f'<span style="font-family:\'Space Mono\',monospace;font-size:0.7rem;'
+    f'color:{session_color};font-weight:700;">'
+    f'{session_emoji} {session_name}</span>',
     unsafe_allow_html=True,
 )
 
 st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
 
+# ── Session schedule info box ─────────────────────────────────────────────────
+st.markdown(f"""
+<div style="background:#0d1520;border:1px solid #1a2d45;
+border-left:3px solid {session_color};padding:10px 16px;border-radius:3px;
+display:flex;gap:24px;flex-wrap:wrap;margin-bottom:8px;">
+  <span style="font-family:'Space Mono',monospace;font-size:0.62rem;color:#3d5a73;">
+    🌅 PRE-MARKET&nbsp;&nbsp;11:00–16:30 🇮🇱
+  </span>
+  <span style="font-family:'Space Mono',monospace;font-size:0.62rem;color:#3d5a73;">
+    📈 MARKET OPEN&nbsp;&nbsp;16:30–23:00 🇮🇱
+  </span>
+  <span style="font-family:'Space Mono',monospace;font-size:0.62rem;color:#3d5a73;">
+    🌙 AFTER-HOURS&nbsp;&nbsp;23:00–03:00 🇮🇱
+  </span>
+  <span style="font-family:'Space Mono',monospace;font-size:0.62rem;color:#3d5a73;">
+    💤 CLOSED&nbsp;&nbsp;03:00–11:00 🇮🇱
+  </span>
+</div>
+""", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCAN TRIGGER
@@ -628,7 +697,7 @@ st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
 
 col_btn, col_status = st.columns([2, 8])
 with col_btn:
-    scan_clicked = st.button("⬡  SCAN PRE-MARKET", use_container_width=True)
+    scan_clicked = st.button(btn_label, use_container_width=True)
 
 status_placeholder = col_status.empty()
 progress_placeholder = st.empty()
@@ -644,7 +713,8 @@ if scan_clicked:
         progress_bar = progress_bar,
         status_text  = status_placeholder,
     )
-    st.session_state["scan_results"] = df_results
+    st.session_state["scan_results"]    = df_results
+    st.session_state["scan_session"]    = session_name
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -665,7 +735,7 @@ if "scan_results" in st.session_state and st.session_state["scan_results"] is no
     top_gap    = df["Gap %"].max() if not df.empty and "Gap %" in df.columns else None
 
     with k1:
-        st.metric("SCAN TIME (UTC)", last_time)
+        st.metric("SCAN TIME 🇮🇱", last_time)
     with k2:
         st.metric("TICKERS SCANNED", f"{total_seen:,}")
     with k3:
@@ -682,7 +752,7 @@ if "scan_results" in st.session_state and st.session_state["scan_results"] is no
             '<div style="background:#0d1520;border:1px solid #1a2d45;border-left:3px solid #ff4560;'
             'padding:16px 20px;border-radius:3px;font-family:\'Space Mono\',monospace;font-size:0.75rem;'
             'color:#7a9ab8;">NO CANDIDATES FOUND matching current filter criteria.<br/>'
-            'Consider loosening the Gap % or Volume thresholds, or wait until pre-market activity increases.'
+            'Consider loosening the Gap % or Volume thresholds, or wait for active session.'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -742,8 +812,13 @@ else:
       <p style="font-family:'Space Mono',monospace;font-size:0.75rem;color:#7a9ab8;
       line-height:1.8;margin:0;">
       1. Adjust scan parameters in the sidebar (or use defaults).<br/>
-      2. Press <span style="color:#00e5a0;font-weight:700;">SCAN PRE-MARKET</span>
-         during the 4:00–9:30 AM ET pre-market window.<br/>
+      2. Press the scan button during an active session (Israel time):<br/>
+      &nbsp;&nbsp;&nbsp;🌅 <span style="color:#00e5a0;font-weight:700;">PRE-MARKET</span>
+         — 11:00–16:30 🇮🇱<br/>
+      &nbsp;&nbsp;&nbsp;📈 <span style="color:#ffb800;font-weight:700;">MARKET OPEN</span>
+         — 16:30–23:00 🇮🇱<br/>
+      &nbsp;&nbsp;&nbsp;🌙 <span style="color:#3b9eff;font-weight:700;">AFTER-HOURS</span>
+         — 23:00–03:00 🇮🇱<br/>
       3. Review candidates sorted by Float Tier → Gap %.<br/>
       4. 🔥 <span style="color:#ffb800;font-weight:700;">PREMIUM</span> rows =
          float &lt; 5M shares (highest momentum potential).<br/>
@@ -761,8 +836,8 @@ else:
       <p style="font-family:'Space Mono',monospace;font-size:0.72rem;color:#7a9ab8;
       line-height:2.0;margin:0;">
       ▸ US Equities Only (NYSE / NASDAQ / AMEX)<br/>
-      ▸ Price: $1.00 – $15.00<br/>
-      ▸ Pre-Market Gap Up: ≥ +20%<br/>
+      ▸ Price: $1.00 – $20.00<br/>
+      ▸ Gap Up: ≥ +20%<br/>
       ▸ Volume: &gt; 500,000 shares<br/>
       ▸ Float: &lt; 20,000,000 shares
       </p>
