@@ -229,13 +229,13 @@ body::before {
 REQUEST_DELAY = 0.35   # seconds between yfinance calls — polite pacing
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HARDCODED TICKER UNIVERSE
-# Source: Finviz Screener — filters applied:
-#   cap:microunder | geo:usa | sh_avgvol:o500 | sh_float:u20 | sh_price:1to15
-# 163 US micro-cap tickers, float < 20M, avg vol > 500K, price $1–$15
-# Update this list periodically from Finviz to keep the universe fresh.
+# TICKER UNIVERSE — 196 tickers
+# Sources:
+#   • Finviz Screener (163): cap:microunder | geo:usa | sh_avgvol:o500 | sh_float:u20
+#   • Manual additions (33): gainers/losers $1–$20 spotted on 22/04
 # ─────────────────────────────────────────────────────────────────────────────
 FINVIZ_UNIVERSE = [
+    # ── Original Finviz 163 ──────────────────────────────────────────────
     # 1–20
     "ADTX", "AGAE", "AGH",  "AGIG", "AIB",  "AIFF", "AIM",  "AIMD",
     "AIRS", "ALBT", "AMOD", "ANNA", "ANY",  "APRE", "ARAI", "ARTL",
@@ -270,6 +270,42 @@ FINVIZ_UNIVERSE = [
     "VRME", "VTAK", "XHLD", "XPON",
     # 161–163
     "XWEL", "YCBD", "ZSPC",
+
+    # ── Manual additions 22/04 — gainers $1–$20 ─────────────────────────
+    "AKAN",   # Akanda           $10.21  +214%
+    "AGPU",   # Axe Compute       $8.75   +79%
+    "TORO",   # Toro Corp         $6.76   +73%
+    "ELPW",   # eLong Power       $2.59   +65%
+    "HCAI",   # Huachen AI        $9.74   +43%
+    "BEEM",   # Beem Global       $1.97   +30%
+    "GNLN",   # Greenline Hold    $5.53   +41%
+    "BTM",    # Bitcoin Depot     $7.60   +18%
+    "TRUG",   # Trugolf Hold      $2.76   +18%
+    "NUCL",   # Eagle Nuclear    $12.46   +18%
+    "LWLG",   # Lightwave Logic  $15.16   +17%
+    "PLRZ",   # Polyrizon        $14.64   +17%
+    "TRT",    # Trio-Tech Intl    $8.26   +17%
+    "HELP",   # Cybin             $5.77   +17%
+    "NVTS",   # Navitas Semi     $18.47   +20%
+    "WSHP",   # WeShop Hold      $12.11   +20%
+    "WTI",    # W&T Offshore      $3.90   +20%
+    "CGC",    # Canopy Growth     $1.38   +21%
+    "ACTU",   # Actuate Therap    $2.78   +23%
+    "CVV",    # CVD Equipment     $5.82   +22%
+    "REPL",   # Replimune Grp     $2.27   +22%
+    "NSRX",   # Nasus Pharma      $3.89   +22%
+
+    # ── Manual additions 22/04 — losers $1–$20 ──────────────────────────
+    "STI",    # Solidion Tech     $4.02   -32%
+    "FGI",    # FGI Industries    $7.70   -32%
+    "SRAD",   # Sportradar Grp   $13.04   -23%
+    "VTIX",   # Virtuix Hold      $5.26   -21%
+    "NN",     # NextNav Acq      $17.57   -22%
+    "AMST",   # Amssite           $1.08   -17%
+    "PALI",   # Palisades Bio     $2.34   -16%
+    "SMX",    # SMX Security      $3.68   -15%
+    "CAST",   # Freecast          $2.35   -14%
+    "TMDE",   # TMD Energy        $1.25   -14%
 ]
 
 
