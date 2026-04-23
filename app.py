@@ -227,6 +227,41 @@ body::before {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS  (must be defined before any Streamlit sidebar/widget code)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_float(val) -> Optional[float]:
+    try:
+        return float(val) if val is not None else None
+    except (ValueError, TypeError):
+        return None
+
+def _fmt_volume(v) -> str:
+    if v is None: return "N/A"
+    v = int(v)
+    if v >= 1_000_000: return f"{v/1_000_000:.2f}M"
+    if v >= 1_000:     return f"{v/1_000:.1f}K"
+    return str(v)
+
+def _fmt_float_shares(v) -> str:
+    if v is None: return "N/A"
+    v = int(v)
+    if v >= 1_000_000: return f"{v/1_000_000:.2f}M"
+    return f"{v:,}"
+
+def _fmt_currency(v) -> str:
+    if v is None: return "N/A"
+    return f"${float(v):.2f}"
+
+def _fmt_market_cap(v) -> str:
+    if v is None: return "N/A"
+    v = float(v)
+    if v >= 1e9:  return f"${v/1e9:.2f}B"
+    if v >= 1e6:  return f"${v/1e6:.0f}M"
+    return f"${v:,.0f}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS & DEFAULTS
 # ─────────────────────────────────────────────────────────────────────────────
 
