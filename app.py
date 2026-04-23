@@ -318,6 +318,8 @@ TICKER_UNIVERSE = [
     "LWLG","PLRZ","TRT", "HELP","NVTS","WSHP","WTI", "CGC", "ACTU","CVV",
     "REPL","NSRX","STI", "FGI", "SRAD","VTIX","NN",  "AMST","PALI","SMX",
     "CAST","TMDE",
+    # ── תוספות 23/04 after-market movers ────────────────────────────────
+    "AUUD","QS","ASGN","KREF",
 ]
 
 
