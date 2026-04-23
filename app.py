@@ -8,6 +8,7 @@ Hosting: Streamlit Community Cloud (free tier)
 
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
 from typing import Optional
 
@@ -359,69 +360,98 @@ def fetch_gainer_tickers() -> list[str]:
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_ticker_detail(ticker: str) -> Optional[dict]:
+def batch_fetch_prices(tickers: tuple) -> pd.DataFrame:
     """
-    Fetches all required fields for one ticker via yfinance.
-    Returns None on total failure; missing fields are set to None
-    so the caller can display 'N/A' gracefully.
+    Phase 1 — FAST batch price fetch for all tickers in two calls:
 
-    Why fast_info + info together?
-    • fast_info is lightweight (single HTTP request) and gives price data
-    • full .info is slower but contains float/market-cap — we fetch it
-      only for tickers that pass the price + gap pre-filter
+    Call A → daily bars (5d)  : gives yesterday's official closing price (prev_close)
+    Call B → 2-min bars (1d, prepost=True) : gives the CURRENT price including
+             pre-market prints (05:07 ET = active pre-market)
+
+    This is the correct approach during pre-market hours.
+    A single daily download was returning yesterday vs day-before,
+    causing gap% = ~0 for every ticker → 0 candidates.
     """
     try:
-        t = yf.Ticker(ticker)
-        fi = t.fast_info  # fast, light-weight
+        ticker_list = list(tickers)
 
-        prev_close   = _safe_float(fi.previous_close)
-        current_raw  = _safe_float(fi.last_price)
-        # During pre-market the "last_price" reflects the pre-market quote
-        # yfinance also exposes pre_market_price when market is closed
-        try:
-            pm_price = _safe_float(getattr(fi, "pre_market_price", None))
-        except Exception:
-            pm_price = None
+        # ── Call A: previous close (last completed regular session) ──────
+        daily = yf.download(
+            ticker_list,
+            period      = "5d",
+            interval    = "1d",
+            auto_adjust = True,
+            progress    = False,
+            threads     = True,
+        )
 
-        current_price = pm_price if (pm_price and pm_price > 0) else current_raw
+        # ── Call B: current price including pre-market ───────────────────
+        intraday = yf.download(
+            ticker_list,
+            period      = "1d",
+            interval    = "2m",
+            prepost     = True,   # ← includes pre-market & after-hours bars
+            auto_adjust = True,
+            progress    = False,
+            threads     = True,
+        )
 
-        volume = _safe_float(fi.three_month_average_volume)  # placeholder
-        # Prefer today's volume from .info for accuracy
-        try:
-            day_vol = _safe_float(fi.shares) # not reliable; will overwrite below
-        except Exception:
-            day_vol = None
+        if daily.empty:
+            return pd.DataFrame()
 
-        return {
-            "ticker":       ticker,
-            "prev_close":   prev_close,
-            "current_price": current_price,
-            "volume":       day_vol,
-            "_fi":          fi,   # pass through for info fetch
-        }
+        daily_close    = daily["Close"]
+        intraday_close = intraday["Close"] if not intraday.empty else pd.DataFrame()
+        daily_volume   = daily["Volume"]
+
+        results = {}
+        for ticker in ticker_list:
+            try:
+                # prev_close = last completed daily bar close
+                d_closes = daily_close[ticker].dropna() if ticker in daily_close else pd.Series(dtype=float)
+                if d_closes.empty:
+                    continue
+                prev_close = float(d_closes.iloc[-1])
+
+                # current_price = latest pre-market bar (or fall back to prev_close)
+                if not intraday_close.empty and ticker in intraday_close:
+                    i_closes = intraday_close[ticker].dropna()
+                    current_price = float(i_closes.iloc[-1]) if not i_closes.empty else prev_close
+                else:
+                    current_price = prev_close
+
+                # volume = latest daily volume
+                d_vols = daily_volume[ticker].dropna() if ticker in daily_volume else pd.Series(dtype=float)
+                vol = float(d_vols.iloc[-1]) if not d_vols.empty else None
+
+                results[ticker] = {
+                    "prev_close":    prev_close,
+                    "current_price": current_price,
+                    "volume":        vol,
+                }
+            except Exception:
+                continue
+
+        return pd.DataFrame(results).T
+
     except Exception:
-        return None
+        return pd.DataFrame()
 
 
 def fetch_full_detail(ticker: str) -> Optional[dict]:
     """
-    Full detail fetch (float, market cap, volume) via yf.Ticker.info.
-    Cached implicitly via yfinance's own request cache.
-    Called only for tickers that survive the price/gap pre-filter.
+    Phase 2 — for tickers that passed the quick gap/price/volume filter,
+    fetch float + market cap + short interest via .info.
+    Called in parallel via ThreadPoolExecutor — no sleep needed.
     """
     try:
-        t = yf.Ticker(ticker)
-        info = t.info
+        info = yf.Ticker(ticker).info
 
         prev_close    = _safe_float(info.get("regularMarketPreviousClose") or info.get("previousClose"))
-        # Current price: prefer preMarketPrice, fall back to regularMarketPrice
         pm_price      = _safe_float(info.get("preMarketPrice"))
         reg_price     = _safe_float(info.get("regularMarketPrice") or info.get("currentPrice"))
         current_price = pm_price if (pm_price and pm_price > 0) else reg_price
-
         volume        = _safe_float(info.get("regularMarketVolume") or info.get("volume"))
         float_shares  = _safe_float(info.get("floatShares"))
-        shares_out    = _safe_float(info.get("sharesOutstanding"))
         market_cap    = _safe_float(info.get("marketCap"))
         short_pct     = _safe_float(info.get("shortPercentOfFloat"))
         avg_vol_10d   = _safe_float(info.get("averageVolume10days") or info.get("averageDailyVolume10Day"))
@@ -435,7 +465,6 @@ def fetch_full_detail(ticker: str) -> Optional[dict]:
             "current_price": current_price,
             "volume":        volume,
             "float_shares":  float_shares,
-            "shares_out":    shares_out,
             "market_cap":    market_cap,
             "short_pct":     short_pct,
             "avg_vol_10d":   avg_vol_10d,
@@ -454,56 +483,49 @@ def fetch_full_detail(ticker: str) -> Optional[dict]:
 def apply_filters(
     raw: dict,
     min_price:      float = 1.0,
-    max_price:      float = 15.0,
+    max_price:      float = 20.0,
     min_gap_pct:    float = 20.0,
     min_volume:     int   = 500_000,
     max_float:      int   = 20_000_000,
 ) -> tuple[bool, str]:
     """
     Returns (passes: bool, reject_reason: str).
-    Fail-fast order: cheapest checks first.
+    Fail-fast: cheapest checks first.
     """
-    # ── US equity only ───────────────────────────────────────────────────
     qt = (raw.get("quote_type") or "").upper()
     if qt and qt not in ("EQUITY", ""):
-        return False, f"Not an equity (quoteType={qt})"
+        return False, f"Not an equity ({qt})"
 
     country = (raw.get("country") or "").lower()
     if country and country not in ("united states", "us", "usa", ""):
-        return False, f"Non-US domicile ({country})"
+        return False, f"Non-US ({country})"
 
-    # ── Price range ──────────────────────────────────────────────────────
     price = raw.get("current_price")
     if price is None:
         return False, "No price data"
     if not (min_price <= price <= max_price):
-        return False, f"Price ${price:.2f} outside ${min_price}–${max_price}"
+        return False, f"Price ${price:.2f} out of range"
 
-    # ── Gap up ───────────────────────────────────────────────────────────
     prev = raw.get("prev_close")
     if prev is None or prev <= 0:
-        return False, "No previous close"
+        return False, "No prev close"
     gap_pct = ((price - prev) / prev) * 100
     if gap_pct < min_gap_pct:
-        return False, f"Gap {gap_pct:.1f}% < {min_gap_pct}% required"
+        return False, f"Gap {gap_pct:.1f}%"
 
-    # ── Volume ───────────────────────────────────────────────────────────
     vol = raw.get("volume")
-    if vol is None:
-        pass   # Allow with N/A — don't hard-reject on missing volume
-    elif vol < min_volume:
-        return False, f"Volume {int(vol):,} < {min_volume:,}"
+    if vol is not None and vol < min_volume:
+        return False, f"Volume {int(vol):,}"
 
-    # ── Float ────────────────────────────────────────────────────────────
     flt = raw.get("float_shares")
     if flt is not None and flt > max_float:
-        return False, f"Float {_fmt_float_shares(flt)} > {_fmt_float_shares(max_float)}"
+        return False, f"Float too high"
 
     return True, ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN SCAN ORCHESTRATOR
+# MAIN SCAN ORCHESTRATOR — two-phase fast scan
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_scan(
@@ -516,126 +538,184 @@ def run_scan(
     status_text,
 ) -> pd.DataFrame:
     """
-    Full scan pipeline:
-    1. Fetch gainers list (scrape + yf fallback)
-    2. Per-ticker: fetch full detail, apply filters
-    3. Build results DataFrame
+    PHASE 1 — Batch price download (all 195 tickers, single request, ~5 sec)
+    PHASE 2 — Parallel .info fetch (only gap survivors, 15 threads, ~10-20 sec)
+
+    Total scan time: ~15–30 seconds vs ~4 minutes previously.
     """
 
-    status_text.markdown(
-        '<span style="font-family:\'Space Mono\',monospace;font-size:0.75rem;'
-        'color:#00e5a0;">▶ FETCHING GAINERS LIST…</span>',
-        unsafe_allow_html=True,
-    )
-    progress_bar.progress(5)
+    def msg(text, color="#00e5a0"):
+        status_text.markdown(
+            f'<span style="font-family:\'Space Mono\',monospace;font-size:0.75rem;'
+            f'color:{color};">{text}</span>',
+            unsafe_allow_html=True,
+        )
 
     tickers = fetch_gainer_tickers()
-    if not tickers:
-        st.error("Could not retrieve any tickers. Yahoo Finance may be blocking requests. Try again in 60 seconds.")
+    total   = len(tickers)
+
+    # ── PHASE 1: batch download ───────────────────────────────────────────
+    msg(f"▶ PHASE 1/2 — BATCH DOWNLOAD ({total} tickers)…")
+    progress_bar.progress(8)
+
+    price_df = batch_fetch_prices(tuple(tickers))
+
+    if price_df.empty:
+        st.error("Batch download failed. Try again in 30 seconds.")
         return pd.DataFrame()
 
-    total = len(tickers)
-    status_text.markdown(
-        f'<span style="font-family:\'Space Mono\',monospace;font-size:0.75rem;'
-        f'color:#00e5a0;">▶ {total} TICKERS FOUND — SCANNING…</span>',
-        unsafe_allow_html=True,
-    )
+    progress_bar.progress(40)
 
-    results = []
+    # Quick pre-filter: price range + gap — no .info call needed
+    pre_pass = []
     rejected_counts: dict[str, int] = {}
 
-    for i, ticker in enumerate(tickers):
-        pct = 5 + int((i / total) * 92)
-        progress_bar.progress(pct)
+    for ticker in tickers:
+        if ticker not in price_df.index:
+            rejected_counts["No data"] = rejected_counts.get("No data", 0) + 1
+            continue
 
-        try:
-            raw = fetch_full_detail(ticker)
-            if raw is None:
-                rejected_counts["No data"] = rejected_counts.get("No data", 0) + 1
-                time.sleep(REQUEST_DELAY)
-                continue
+        row       = price_df.loc[ticker]
+        prev      = _safe_float(row.get("prev_close"))
+        price_val = _safe_float(row.get("current_price"))
+        vol       = _safe_float(row.get("volume"))
 
-            passes, reason = apply_filters(
-                raw,
-                min_price   = min_price,
-                max_price   = max_price,
-                min_gap_pct = min_gap_pct,
-                min_volume  = min_volume,
-                max_float   = max_float,
-            )
+        if prev is None or price_val is None or prev <= 0:
+            rejected_counts["No data"] = rejected_counts.get("No data", 0) + 1
+            continue
 
-            if not passes:
-                cat = reason.split(" ")[0] if reason else "Other"
-                rejected_counts[cat] = rejected_counts.get(cat, 0) + 1
-                time.sleep(REQUEST_DELAY)
-                continue
+        if not (min_price <= price_val <= max_price):
+            rejected_counts["Price"] = rejected_counts.get("Price", 0) + 1
+            continue
 
-            # ── All filters passed → record result ───────────────────────
-            price      = raw["current_price"]
-            prev_close = raw["prev_close"]
-            gap_pct    = ((price - prev_close) / prev_close) * 100
+        gap_pct = ((price_val - prev) / prev) * 100
+        if gap_pct < min_gap_pct:
+            rejected_counts["Gap"] = rejected_counts.get("Gap", 0) + 1
+            continue
 
-            float_shares = raw.get("float_shares")
-            float_tier   = (
-                "🔥 PREMIUM"  if (float_shares and float_shares < 5_000_000) else
-                "✅ LOW"      if (float_shares and float_shares < 20_000_000) else
-                "N/A"
-            )
+        if vol is not None and vol < min_volume:
+            rejected_counts["Volume"] = rejected_counts.get("Volume", 0) + 1
+            continue
 
-            # RVOL — relative volume vs. 10-day average
-            vol     = raw.get("volume")
-            avg_vol = raw.get("avg_vol_10d")
-            rvol    = round(vol / avg_vol, 1) if (vol and avg_vol and avg_vol > 0) else None
+        pre_pass.append(ticker)
 
-            # Short float as % — multiply by 100 if stored as decimal
-            si_raw  = raw.get("short_pct")
-            si_pct  = None
-            if si_raw is not None:
-                si_pct = si_raw * 100 if si_raw < 1 else si_raw
+    n_pre = len(pre_pass)
+    progress_bar.progress(50)
 
-            results.append({
-                "Ticker":       ticker,
-                "Price":        price,
-                "Prev Close":   prev_close,
-                "Gap %":        round(gap_pct, 2),
-                "Volume":       int(vol) if vol else None,
-                "RVOL":         rvol,
-                "Float":        int(float_shares) if float_shares else None,
-                "Float Tier":   float_tier,
-                "Short %":      round(si_pct, 1) if si_pct else None,
-                "Market Cap":   raw.get("market_cap"),
-                "Exchange":     raw.get("exchange", ""),
-            })
+    if not pre_pass:
+        msg("✓ NO CANDIDATES after price/gap filter.", "#ff4560")
+        progress_bar.progress(100)
+        st.session_state["last_rejected"]     = rejected_counts
+        st.session_state["last_scan_time"]    = datetime.now().strftime("%H:%M:%S")
+        st.session_state["last_ticker_count"] = total
+        return pd.DataFrame()
 
-        except Exception as e:
-            rejected_counts["Error"] = rejected_counts.get("Error", 0) + 1
+    # ── PHASE 2: parallel .info for survivors only ────────────────────────
+    msg(f"▶ PHASE 2/2 — FETCHING DETAILS ({n_pre} survivors in parallel)…")
 
-        time.sleep(REQUEST_DELAY)
+    detail_map: dict[str, dict] = {}
+    THREADS = min(15, n_pre)  # cap at 15 to stay polite to Yahoo
+
+    with ThreadPoolExecutor(max_workers=THREADS) as pool:
+        futures = {pool.submit(fetch_full_detail, t): t for t in pre_pass}
+        done_count = 0
+        for future in as_completed(futures):
+            ticker = futures[future]
+            done_count += 1
+            pct = 50 + int((done_count / n_pre) * 45)
+            progress_bar.progress(pct)
+            try:
+                result = future.result()
+                if result:
+                    detail_map[ticker] = result
+            except Exception:
+                pass
+
+    progress_bar.progress(96)
+
+    # ── Build results ─────────────────────────────────────────────────────
+    results = []
+    for ticker in pre_pass:
+        raw = detail_map.get(ticker)
+        if raw is None:
+            # Fall back to batch price data if .info failed
+            row = price_df.loc[ticker]
+            raw = {
+                "ticker":        ticker,
+                "prev_close":    _safe_float(row.get("prev_close")),
+                "current_price": _safe_float(row.get("current_price")),
+                "volume":        _safe_float(row.get("volume")),
+                "float_shares":  None,
+                "market_cap":    None,
+                "short_pct":     None,
+                "avg_vol_10d":   None,
+                "country":       "",
+                "exchange":      "",
+                "quote_type":    "",
+            }
+
+        passes, reason = apply_filters(
+            raw,
+            min_price   = min_price,
+            max_price   = max_price,
+            min_gap_pct = min_gap_pct,
+            min_volume  = min_volume,
+            max_float   = max_float,
+        )
+        if not passes:
+            cat = reason.split(" ")[0] if reason else "Other"
+            rejected_counts[cat] = rejected_counts.get(cat, 0) + 1
+            continue
+
+        price_val  = raw["current_price"]
+        prev_close = raw["prev_close"]
+        gap_pct    = ((price_val - prev_close) / prev_close) * 100
+
+        float_shares = raw.get("float_shares")
+        float_tier   = (
+            "🔥 PREMIUM" if (float_shares and float_shares < 5_000_000) else
+            "✅ LOW"     if (float_shares and float_shares < 20_000_000) else
+            "N/A"
+        )
+
+        vol     = raw.get("volume")
+        avg_vol = raw.get("avg_vol_10d")
+        rvol    = round(vol / avg_vol, 1) if (vol and avg_vol and avg_vol > 0) else None
+
+        si_raw = raw.get("short_pct")
+        si_pct = None
+        if si_raw is not None:
+            si_pct = si_raw * 100 if si_raw < 1 else si_raw
+
+        results.append({
+            "Ticker":     ticker,
+            "Price":      price_val,
+            "Prev Close": prev_close,
+            "Gap %":      round(gap_pct, 2),
+            "Volume":     int(vol) if vol else None,
+            "RVOL":       rvol,
+            "Float":      int(float_shares) if float_shares else None,
+            "Float Tier": float_tier,
+            "Short %":    round(si_pct, 1) if si_pct else None,
+            "Market Cap": raw.get("market_cap"),
+            "Exchange":   raw.get("exchange", ""),
+        })
 
     progress_bar.progress(100)
-    status_text.markdown(
-        f'<span style="font-family:\'Space Mono\',monospace;font-size:0.75rem;'
-        f'color:#00e5a0;">✓ SCAN COMPLETE — {len(results)} candidates found</span>',
-        unsafe_allow_html=True,
-    )
+    msg(f"✓ DONE — {len(results)} candidates from {total} tickers scanned")
+
+    st.session_state["last_rejected"]     = rejected_counts
+    st.session_state["last_scan_time"]    = datetime.now().strftime("%H:%M:%S")
+    st.session_state["last_ticker_count"] = total
 
     if not results:
         return pd.DataFrame()
 
     df = pd.DataFrame(results)
-
-    # Sort: premium float first, then by gap %
     tier_order = {"🔥 PREMIUM": 0, "✅ LOW": 1, "N/A": 2}
     df["_tier_sort"] = df["Float Tier"].map(tier_order)
     df = df.sort_values(["_tier_sort", "Gap %"], ascending=[True, False]).drop("_tier_sort", axis=1)
-    df = df.reset_index(drop=True)
-
-    # Store rejection stats in session state for display
-    st.session_state["last_rejected"] = rejected_counts
-    st.session_state["last_scan_time"] = datetime.now().strftime("%H:%M:%S")
-    st.session_state["last_ticker_count"] = total
-
-    return df
+    return df.reset_index(drop=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
