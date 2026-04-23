@@ -10,9 +10,11 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
+from io import StringIO
 from typing import Optional
 
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -227,270 +229,251 @@ body::before {
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS & DEFAULTS
 # ─────────────────────────────────────────────────────────────────────────────
-REQUEST_DELAY = 0.35   # seconds between yfinance calls — polite pacing
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TICKER UNIVERSE — 196 tickers
-# Sources:
-#   • Finviz Screener (163): cap:microunder | geo:usa | sh_avgvol:o500 | sh_float:u20
-#   • Manual additions (33): gainers/losers $1–$20 spotted on 22/04
+# DYNAMIC UNIVERSE — NASDAQ Trader FTP (updated daily, ~5,000+ US stocks)
 # ─────────────────────────────────────────────────────────────────────────────
-FINVIZ_UNIVERSE = [
-    # ── Original Finviz 163 ──────────────────────────────────────────────
-    # 1–20
-    "ADTX", "AGAE", "AGH",  "AGIG", "AIB",  "AIFF", "AIM",  "AIMD",
-    "AIRS", "ALBT", "AMOD", "ANNA", "ANY",  "APRE", "ARAI", "ARTL",
-    "ASBP", "ASTC", "ASTI", "AUID",
-    # 21–40
-    "AZTR", "BATL", "BCG",  "BENF", "BFRG", "BIAF", "BIRD", "BKKT",
-    "BKYI", "BNBX", "BNZI", "BOXL", "BRN",  "BTBD", "BTOC", "BYRN",
-    "CALC", "CAPS", "CDIO", "CETX",
-    # 41–60
-    "CETY", "CLDI", "COCP", "CODX", "CURX", "CYCN", "CYCU", "CYN",
-    "DBGI", "DEVS", "DRCT", "DRMA", "EDBL", "EEIQ", "EFOI", "ELAB",
-    "EMPD", "ENSC", "ENVB", "EVTV",
-    # 61–80
-    "EZRA", "FATN", "FCUV", "FEED", "FLYX", "FRGT", "FRMM", "FUSE",
-    "GBR",  "GCTK", "GIPR", "GLND", "GNPX", "GWH",  "GXAI", "HCTI",
-    "HCWB", "HIND", "HOTH", "IPST",
-    # 81–100
-    "IPW",  "IVDA", "JACK", "JAGX", "KAPA", "KIDZ", "KITT", "KPRX",
-    "KSCP", "LASE", "LGVN", "LIMN", "LNAI", "LOCL", "LRHC", "LTRN",
-    "MAMO", "MEHA", "MGRX", "MIGI",
-    # 101–120
-    "MNTS", "MRAM", "MSS",  "MYSE", "MYXXU","NUWE", "NVVE", "NXL",
-    "OBAI", "OGEN", "OLB",  "OLOX", "ONCO", "ONFO", "ONMD", "OSRH",
-    "PBM",  "PFSA", "PHGE", "PHIO",
-    # 121–140
-    "PLYX", "POLA", "PRSO", "QCLS", "QNCX", "QVCGA","RENX", "REVB",
-    "RIME", "RMSG", "ROLR", "RVPH", "SBEV", "SEGG", "SER",  "SEV",
-    "SILO", "SKYQ", "SLAI", "SNAL",
-    # 141–160
-    "SNBR", "SNYR", "SOAR", "SOPA", "SOWG", "SQFT", "SST",  "SUNE",
-    "SXTP", "TBH",  "TNON", "UGRO", "USBC", "VEAA", "VEEE", "VIVS",
-    "VRME", "VTAK", "XHLD", "XPON",
-    # 161–163
-    "XWEL", "YCBD", "ZSPC",
+# Two official NASDAQ pipe-delimited files list every exchange-listed US stock:
+#   nasdaqlisted.txt  — NASDAQ (NMS + Small Cap + Capital Market)
+#   otherlisted.txt   — NYSE, AMEX, ARCA, BATS
+# Together they cover ~7,000 symbols; after filtering ~4,000 common stocks.
+# Cached for 6 hours so the universe refreshes once per trading day.
 
-    # ── Manual additions 22/04 — gainers $1–$20 ─────────────────────────
-    "AKAN",   # Akanda           $10.21  +214%
-    "AGPU",   # Axe Compute       $8.75   +79%
-    "TORO",   # Toro Corp         $6.76   +73%
-    "ELPW",   # eLong Power       $2.59   +65%
-    "HCAI",   # Huachen AI        $9.74   +43%
-    "BEEM",   # Beem Global       $1.97   +30%
-    "GNLN",   # Greenline Hold    $5.53   +41%
-    "BTM",    # Bitcoin Depot     $7.60   +18%
-    "TRUG",   # Trugolf Hold      $2.76   +18%
-    "NUCL",   # Eagle Nuclear    $12.46   +18%
-    "LWLG",   # Lightwave Logic  $15.16   +17%
-    "PLRZ",   # Polyrizon        $14.64   +17%
-    "TRT",    # Trio-Tech Intl    $8.26   +17%
-    "HELP",   # Cybin             $5.77   +17%
-    "NVTS",   # Navitas Semi     $18.47   +20%
-    "WSHP",   # WeShop Hold      $12.11   +20%
-    "WTI",    # W&T Offshore      $3.90   +20%
-    "CGC",    # Canopy Growth     $1.38   +21%
-    "ACTU",   # Actuate Therap    $2.78   +23%
-    "CVV",    # CVD Equipment     $5.82   +22%
-    "REPL",   # Replimune Grp     $2.27   +22%
-    "NSRX",   # Nasus Pharma      $3.89   +22%
+NASDAQ_FILE_URL = "https://ftp.nasdaqtrader.com/dynamic/SymbolDirectory/nasdaqlisted.txt"
+OTHER_FILE_URL  = "https://ftp.nasdaqtrader.com/dynamic/SymbolDirectory/otherlisted.txt"
 
-    # ── Manual additions 22/04 — losers $1–$20 ──────────────────────────
-    "STI",    # Solidion Tech     $4.02   -32%
-    "FGI",    # FGI Industries    $7.70   -32%
-    "SRAD",   # Sportradar Grp   $13.04   -23%
-    "VTIX",   # Virtuix Hold      $5.26   -21%
-    "NN",     # NextNav Acq      $17.57   -22%
-    "AMST",   # Amssite           $1.08   -17%
-    "PALI",   # Palisades Bio     $2.34   -16%
-    "SMX",    # SMX Security      $3.68   -15%
-    "CAST",   # Freecast          $2.35   -14%
-    "TMDE",   # TMD Energy        $1.25   -14%
+# Fallback: the 195 manually curated tickers used before, in case both URLs fail
+FALLBACK_UNIVERSE = [
+    "ADTX","AGAE","AGH","AGIG","AIB","AIFF","AIM","AIMD","AIRS","ALBT",
+    "AMOD","ANNA","ANY","APRE","ARAI","ARTL","ASBP","ASTC","ASTI","AUID",
+    "AZTR","BATL","BCG","BENF","BFRG","BIAF","BIRD","BKKT","BKYI","BNBX",
+    "BNZI","BOXL","BRN","BTBD","BTOC","BYRN","CALC","CAPS","CDIO","CETX",
+    "CETY","CLDI","COCP","CODX","CURX","CYCN","CYCU","CYN","DBGI","DEVS",
+    "DRCT","DRMA","EDBL","EEIQ","EFOI","ELAB","EMPD","ENSC","ENVB","EVTV",
+    "EZRA","FATN","FCUV","FEED","FLYX","FRGT","FRMM","FUSE","GBR","GCTK",
+    "GIPR","GLND","GNPX","GWH","GXAI","HCTI","HCWB","HIND","HOTH","IPST",
+    "IPW","IVDA","JACK","JAGX","KAPA","KIDZ","KITT","KPRX","KSCP","LASE",
+    "LGVN","LIMN","LNAI","LOCL","LRHC","LTRN","MAMO","MEHA","MGRX","MIGI",
+    "MNTS","MRAM","MSS","MYSE","NUWE","NVVE","NXL","OBAI","OGEN","OLB",
+    "OLOX","ONCO","ONFO","ONMD","OSRH","PBM","PFSA","PHGE","PHIO","PLYX",
+    "POLA","PRSO","QCLS","QNCX","RENX","REVB","RIME","RMSG","ROLR","RVPH",
+    "SBEV","SEGG","SER","SEV","SILO","SKYQ","SNAL","SNBR","SNYR","SOAR",
+    "SOPA","SOWG","SQFT","SST","SUNE","SXTP","TBH","TNON","UGRO","USBC",
+    "VEAA","VEEE","VIVS","VRME","VTAK","XHLD","XPON","XWEL","YCBD","ZSPC",
+    "AKAN","AGPU","TORO","ELPW","HCAI","BEEM","GNLN","BTM","TRUG","NUCL",
+    "LWLG","PLRZ","TRT","HELP","NVTS","WSHP","WTI","CGC","ACTU","CVV",
+    "REPL","NSRX","STI","FGI","SRAD","VTIX","NN","AMST","PALI","SMX",
+    "CAST","TMDE",
 ]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DATA LAYER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _safe_float(val) -> Optional[float]:
-    """Convert any value to float or return None."""
-    try:
-        return float(val) if val is not None else None
-    except (ValueError, TypeError):
-        return None
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+    )
+}
 
 
-def _fmt_volume(v) -> str:
-    if v is None: return "N/A"
-    v = int(v)
-    if v >= 1_000_000: return f"{v/1_000_000:.2f}M"
-    if v >= 1_000:     return f"{v/1_000:.1f}K"
-    return str(v)
-
-
-def _fmt_float_shares(v) -> str:
-    if v is None: return "N/A"
-    v = int(v)
-    if v >= 1_000_000: return f"{v/1_000_000:.2f}M"
-    return f"{v:,}"
-
-
-def _fmt_currency(v) -> str:
-    if v is None: return "N/A"
-    return f"${float(v):.2f}"
-
-
-def _fmt_market_cap(v) -> str:
-    if v is None: return "N/A"
-    v = float(v)
-    if v >= 1e9:  return f"${v/1e9:.2f}B"
-    if v >= 1e6:  return f"${v/1e6:.0f}M"
-    return f"${v:,.0f}"
-
-
+@st.cache_data(ttl=3600 * 6, show_spinner=False)
 def fetch_gainer_tickers() -> list[str]:
     """
-    Returns the hardcoded Finviz universe of 163 pre-filtered US micro-cap
-    tickers (float < 20M, avg vol > 500K, price $1–$15, US only).
-    No scraping needed — no rate limits, no failures, instant return.
-    """
-    return list(FINVIZ_UNIVERSE)
+    Downloads ALL US-listed common stocks from NASDAQ's official symbol files.
+    Returns a deduplicated list of clean 1-5 letter tickers.
 
+    Filters applied at build time:
+    • Excludes test issues (Test Issue == 'Y')
+    • Excludes ETFs (ETF == 'Y')
+    • Excludes warrants, units, rights (symbol ends with W/WS/R/U or contains $)
+    • Keeps only symbols matching [A-Z]{1,5}
 
-def _scan_single_ticker(ticker: str) -> Optional[dict]:
+    Result: ~4,000–5,000 common stocks, cached for 6 hours.
+    Falls back to the 195-ticker manual list if both URLs fail.
     """
-    Fetches ALL data for one ticker in a single .info call.
-    Returns a complete dict or None on failure.
-    preMarketPrice is returned when market is in pre-market session.
-    """
-    try:
-        info = yf.Ticker(ticker).info
-        pm_price  = _safe_float(info.get("preMarketPrice"))
-        reg_price = _safe_float(info.get("regularMarketPrice") or info.get("currentPrice"))
-        current_price = (pm_price if pm_price and pm_price > 0 else reg_price)
-        prev_close    = _safe_float(info.get("regularMarketPreviousClose") or info.get("previousClose"))
-        if not current_price or not prev_close:
+    import re
+    tickers: set[str] = set()
+
+    def clean_sym(s: str) -> Optional[str]:
+        if not isinstance(s, str):
             return None
-        si_raw = _safe_float(info.get("shortPercentOfFloat"))
-        return {
-            "ticker":        ticker,
-            "current_price": current_price,
-            "prev_close":    prev_close,
-            "volume":        _safe_float(info.get("regularMarketVolume") or info.get("volume")),
-            "float_shares":  _safe_float(info.get("floatShares")),
-            "market_cap":    _safe_float(info.get("marketCap")),
-            "short_pct":     si_raw,
-            "avg_vol_10d":   _safe_float(info.get("averageVolume10days") or info.get("averageDailyVolume10Day")),
-            "country":       info.get("country", ""),
-            "exchange":      info.get("exchange", ""),
-            "quote_type":    info.get("quoteType", ""),
-        }
+        s = s.strip().upper()
+        if not re.fullmatch(r'[A-Z]{1,5}', s):
+            return None
+        if s.endswith(("W", "WS", "R", "U")) and len(s) > 1:
+            return None
+        return s
+
+    # ── NASDAQ listed ────────────────────────────────────────────────────
+    try:
+        resp = requests.get(NASDAQ_FILE_URL, headers=HEADERS, timeout=15)
+        if resp.status_code == 200:
+            df = pd.read_csv(StringIO(resp.text), sep='|')
+            # Drop the last summary row (starts with "File Creation Time")
+            df = df[~df["Symbol"].astype(str).str.startswith("File")]
+            # Filter out test issues and ETFs
+            if "Test Issue" in df.columns:
+                df = df[df["Test Issue"] != "Y"]
+            if "ETF" in df.columns:
+                df = df[df["ETF"] != "Y"]
+            for sym in df["Symbol"]:
+                clean = clean_sym(sym)
+                if clean:
+                    tickers.add(clean)
+    except Exception:
+        pass
+
+    # ── NYSE / AMEX / ARCA (otherlisted) ────────────────────────────────
+    try:
+        resp = requests.get(OTHER_FILE_URL, headers=HEADERS, timeout=15)
+        if resp.status_code == 200:
+            df = pd.read_csv(StringIO(resp.text), sep='|')
+            df = df[~df["ACT Symbol"].astype(str).str.startswith("File")]
+            if "Test Issue" in df.columns:
+                df = df[df["Test Issue"] != "Y"]
+            if "ETF" in df.columns:
+                df = df[df["ETF"] != "Y"]
+            # "Exchange" column: N=NYSE, A=AMEX, P=ARCA, Z=BATS, V=IEX
+            # Exclude non-US exchanges if present
+            for sym in df["ACT Symbol"]:
+                clean = clean_sym(sym)
+                if clean:
+                    tickers.add(clean)
+    except Exception:
+        pass
+
+    if not tickers:
+        # Both downloads failed — use hardcoded fallback
+        return list(FALLBACK_UNIVERSE)
+
+    result = sorted(tickers)
+    return result
+
+
+def _quick_price(ticker: str) -> Optional[dict]:
+    """Phase 1: fast_info only — lightweight, includes pre-market price."""
+    try:
+        fi    = yf.Ticker(ticker).fast_info
+        prev  = _safe_float(fi.previous_close)
+        price = _safe_float(fi.last_price)
+        vol   = _safe_float(fi.last_volume)
+        if prev and price:
+            return {"prev_close": prev, "current_price": price, "volume": vol}
+        return None
     except Exception:
         return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FILTER ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
-
-def apply_filters(raw, min_price=1.0, max_price=20.0, min_gap_pct=20.0,
-                  min_volume=500_000, max_float=20_000_000):
-    qt = (raw.get("quote_type") or "").upper()
-    if qt and qt not in ("EQUITY", ""):
-        return False, "Not equity"
-    country = (raw.get("country") or "").lower()
-    if country and country not in ("united states", "us", "usa", ""):
-        return False, "Non-US"
-    price = raw.get("current_price")
-    if not price:
-        return False, "No price"
-    if not (min_price <= price <= max_price):
-        return False, "Price"
-    prev = raw.get("prev_close")
-    if not prev or prev <= 0:
-        return False, "No prev close"
-    if ((price - prev) / prev * 100) < min_gap_pct:
-        return False, "Gap"
-    vol = raw.get("volume")
-    if vol is not None and vol < min_volume:
-        return False, "Volume"
-    flt = raw.get("float_shares")
-    if flt is not None and flt > max_float:
-        return False, "Float"
-    return True, ""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN SCAN — single-phase, 8 threads, no external batch calls
-# ─────────────────────────────────────────────────────────────────────────────
-
 def run_scan(min_price, max_price, min_gap_pct, min_volume, max_float,
              progress_bar, status_text):
+    """
+    Two-phase scan for large universes (4,000+ tickers):
+    Phase 1: fast_info (8 threads) for ALL tickers → filter by price/gap/vol
+    Phase 2: .info for survivors only (~5-20 tickers) → float/SI/country
+    """
     def msg(text, color="#00e5a0"):
         status_text.markdown(
-            f'<span style="font-family:\'Space Mono\',monospace;font-size:0.75rem;color:{color};">{text}</span>',
+            f'<span style="font-family:\'Space Mono\',monospace;'
+            f'font-size:0.75rem;color:{color};">{text}</span>',
             unsafe_allow_html=True)
 
+    msg("▶ LOADING UNIVERSE…")
+    progress_bar.progress(2)
     tickers = fetch_gainer_tickers()
     total   = len(tickers)
-    msg(f"▶ SCANNING {total} TICKERS — 8 threads…")
+    msg(f"▶ PHASE 1/2 — PRICE SCAN ({total:,} tickers)…")
     progress_bar.progress(5)
 
-    results = []
-    rejected_counts: dict[str, int] = {}
+    pre_pass: list       = []
+    rejected_counts: dict = {}
     done = 0
 
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(_scan_single_ticker, t): t for t in tickers}
+        futures = {pool.submit(_quick_price, t): t for t in tickers}
         for future in as_completed(futures):
             ticker = futures[future]
             done  += 1
-            progress_bar.progress(5 + int((done / total) * 88))
+            progress_bar.progress(5 + int((done / total) * 70))
             try:
-                raw = future.result()
+                data = future.result()
             except Exception:
                 rejected_counts["Error"] = rejected_counts.get("Error", 0) + 1
                 continue
-            if raw is None:
+            if not data:
                 rejected_counts["No data"] = rejected_counts.get("No data", 0) + 1
                 continue
-            passes, reason = apply_filters(raw, min_price, max_price,
-                                            min_gap_pct, min_volume, max_float)
-            if not passes:
-                rejected_counts[reason] = rejected_counts.get(reason, 0) + 1
+            pv   = data["current_price"]
+            prev = data["prev_close"]
+            vol  = data.get("volume")
+            if not (min_price <= pv <= max_price):
+                rejected_counts["Price"] = rejected_counts.get("Price", 0) + 1
                 continue
+            if ((pv - prev) / prev * 100) < min_gap_pct:
+                rejected_counts["Gap"] = rejected_counts.get("Gap", 0) + 1
+                continue
+            if vol is not None and vol < min_volume:
+                rejected_counts["Volume"] = rejected_counts.get("Volume", 0) + 1
+                continue
+            pre_pass.append((ticker, data))
 
-            price_val    = raw["current_price"]
-            prev_close   = raw["prev_close"]
-            gap_pct      = (price_val - prev_close) / prev_close * 100
-            float_shares = raw.get("float_shares")
-            vol          = raw.get("volume")
-            avg_vol      = raw.get("avg_vol_10d")
-            si_raw       = raw.get("short_pct")
-            float_tier   = ("🔥 PREMIUM" if (float_shares and float_shares < 5_000_000) else
-                            "✅ LOW"     if (float_shares and float_shares < 20_000_000) else "N/A")
-            rvol   = round(vol / avg_vol, 1) if (vol and avg_vol and avg_vol > 0) else None
-            si_pct = None
-            if si_raw is not None:
-                si_pct = si_raw * 100 if si_raw < 1 else si_raw
-            results.append({
-                "Ticker":     ticker,
-                "Price":      price_val,
-                "Prev Close": prev_close,
-                "Gap %":      round(gap_pct, 2),
-                "Volume":     int(vol) if vol else None,
-                "RVOL":       rvol,
-                "Float":      int(float_shares) if float_shares else None,
-                "Float Tier": float_tier,
-                "Short %":    round(si_pct, 1) if si_pct else None,
-                "Market Cap": raw.get("market_cap"),
-                "Exchange":   raw.get("exchange", ""),
-            })
+    n_pre = len(pre_pass)
+    msg(f"▶ PHASE 2/2 — DETAIL FETCH ({n_pre} survivors)…")
+    progress_bar.progress(78)
+
+    results = []
+    for i, (ticker, price_data) in enumerate(pre_pass):
+        progress_bar.progress(78 + int((i / max(n_pre, 1)) * 18))
+        try:
+            info         = yf.Ticker(ticker).info
+            float_shares = _safe_float(info.get("floatShares"))
+            market_cap   = _safe_float(info.get("marketCap"))
+            si_raw       = _safe_float(info.get("shortPercentOfFloat"))
+            avg_vol      = _safe_float(info.get("averageVolume10days") or
+                                       info.get("averageDailyVolume10Day"))
+            country      = info.get("country", "")
+            quote_type   = info.get("quoteType", "")
+            exchange     = info.get("exchange", "")
+        except Exception:
+            float_shares = market_cap = si_raw = avg_vol = None
+            country = quote_type = exchange = ""
+
+        qt = quote_type.upper()
+        if qt and qt not in ("EQUITY", ""):
+            rejected_counts["Not equity"] = rejected_counts.get("Not equity", 0) + 1
+            continue
+        ctry = country.lower()
+        if ctry and ctry not in ("united states", "us", "usa", ""):
+            rejected_counts["Non-US"] = rejected_counts.get("Non-US", 0) + 1
+            continue
+        if float_shares is not None and float_shares > max_float:
+            rejected_counts["Float"] = rejected_counts.get("Float", 0) + 1
+            continue
+
+        pv         = price_data["current_price"]
+        prev_close = price_data["prev_close"]
+        vol        = price_data.get("volume")
+        gap_pct    = (pv - prev_close) / prev_close * 100
+        float_tier = ("🔥 PREMIUM" if (float_shares and float_shares < 5_000_000) else
+                      "✅ LOW"     if (float_shares and float_shares < 20_000_000) else "N/A")
+        rvol   = round(vol / avg_vol, 1) if (vol and avg_vol and avg_vol > 0) else None
+        si_pct = None
+        if si_raw is not None:
+            si_pct = si_raw * 100 if si_raw < 1 else si_raw
+
+        results.append({
+            "Ticker":     ticker,
+            "Price":      pv,
+            "Prev Close": prev_close,
+            "Gap %":      round(gap_pct, 2),
+            "Volume":     int(vol) if vol else None,
+            "RVOL":       rvol,
+            "Float":      int(float_shares) if float_shares else None,
+            "Float Tier": float_tier,
+            "Short %":    round(si_pct, 1) if si_pct else None,
+            "Market Cap": market_cap,
+            "Exchange":   exchange,
+        })
 
     progress_bar.progress(100)
-    msg(f"✓ DONE — {len(results)} candidates from {total} tickers")
+    msg(f"✓ DONE — {len(results)} candidates from {total:,} tickers scanned")
     st.session_state["last_rejected"]     = rejected_counts
     st.session_state["last_scan_time"]    = datetime.now().strftime("%H:%M:%S")
     st.session_state["last_ticker_count"] = total
@@ -502,7 +485,6 @@ def run_scan(min_price, max_price, min_gap_pct, min_volume, max_float,
     return df.reset_index(drop=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # DISPLAY HELPERS
 # DISPLAY HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
